@@ -1,0 +1,11 @@
+connector: flatfile
+source_path: outputs/datasets/raw.parquet
+
+transformers:
+  - name: MedianImputer
+  - name: IQRClipper
+  - name: ZScoreClipper
+    params:
+      k: 3.0
+
+output_path: outputs/datasets/clean.parquet

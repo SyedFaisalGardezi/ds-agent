@@ -1,0 +1,34 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  full-cd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Type check
+        run: mypy agent/ --ignore-missing-imports
+      - name: Unit tests
+        run: pytest tests/unit/ -x --cov=agent --cov-fail-under=80
+      - name: DVC dry run
+        run: dvc repro --dry
+      - name: Integration tests
+        run: pytest tests/integration/
+      - name: Docker build
+        run: docker build --target runtime -t ghcr.io/${{ github.repository_owner }}/ds-agent:${{ github.sha }} .
+      - name: Docker push
+        run: docker push ghcr.io/${{ github.repository_owner }}/ds-agent:${{ github.sha }}
+      - name: MLflow metric gate
+        run: python deploy/mlflow_gate.py
+        env:
+          CHALLENGER_SHA: ${{ github.sha }}

@@ -1,0 +1,49 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.key
+credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+.venv_container/
+venv/
+env/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Agent runtime state and local memory
+.agent/
+.chroma/
+*.sqlite
+*.db
+
+# Generated runtime outputs (session data, uploaded datasets, trained model
+# pickles, logs, plots). Regenerable; not the agent source.
+outputs/
+mlruns/
+deploy/model.joblib
+
+# Knowledge graph, regenerable with /graphify
+graphify-out/
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml

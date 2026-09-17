@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: ds-agent
+    static_configs:
+      - targets: ["inference:8000"]

@@ -1,0 +1,32 @@
+{
+  "name": "ds-agent-dev",
+  "dockerComposeFile": ["../deploy/docker-compose.yml"],
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.mypy-type-checker",
+        "charliermarsh.ruff",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests/unit", "--no-cov"],
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        }
+      }
+    }
+  },
+  "postCreateCommand": "pip install -e '.[dev]' && pip install jupyterlab ipykernel",
+  "forwardPorts": [5001, 8001, 8888, 9090, 3000],
+  "remoteEnv": {
+    "OLLAMA_BASE_URL": "http://host.docker.internal:11434"
+  }
+}

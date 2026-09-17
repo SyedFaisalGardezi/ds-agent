@@ -1,0 +1,26 @@
+stages:
+  extract:
+    cmd: python -m agent.pipeline.etl.extractor
+    deps:
+      - agent/pipeline/etl/extractor.py
+      - configs/etl.yaml
+    outs:
+      - outputs/datasets/raw.parquet
+
+  transform:
+    cmd: python -m agent.pipeline.etl.transformer
+    deps:
+      - agent/pipeline/etl/transformer.py
+      - outputs/datasets/raw.parquet
+    outs:
+      - outputs/datasets/clean.parquet
+
+  train:
+    cmd: python -m agent.pipeline.model_builder.trainer
+    deps:
+      - agent/pipeline/model_builder/trainer.py
+      - outputs/datasets/clean.parquet
+    outs:
+      - outputs/models/
+    metrics:
+      - outputs/reports/metrics.json

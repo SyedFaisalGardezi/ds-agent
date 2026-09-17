@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ds-agent chat</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
+         background: #0f1115; color: #e6e6e6; height: 100vh; display: flex;
+         flex-direction: column; }
+  header { padding: 12px 18px; border-bottom: 1px solid #2a2d36;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; color: #ffd57a; }
+  header .sid { font-family: ui-monospace, monospace; font-size: 12px;
+                color: #8a8f99; }
+  header button { margin-left: auto; background: #ffd57a; color: #1a1d24;
+                  border: 0; padding: 6px 12px; border-radius: 4px;
+                  font-weight: 600; cursor: pointer; }
+  main { flex: 1; display: grid; grid-template-columns: 320px 1fr;
+         min-height: 0; }
+  aside { border-right: 1px solid #2a2d36; padding: 14px; overflow-y: auto;
+          background: #14171f; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+             color: #8a8f99; margin: 18px 0 8px; }
+  aside h2:first-child { margin-top: 0; }
+  aside .row { font-size: 13px; margin: 4px 0; word-break: break-word; }
+  aside .row b { color: #ffd57a; }
+  aside input[type=text] { width: 100%; padding: 6px 8px;
+                           background: #1a1d24; color: #e6e6e6;
+                           border: 1px solid #2a2d36; border-radius: 4px;
+                           font-size: 13px; }
+  aside button { margin-top: 6px; width: 100%; background: #2a2d36;
+                 color: #e6e6e6; border: 0; padding: 6px; border-radius: 4px;
+                 cursor: pointer; font-size: 12px; }
+  aside button:hover { background: #3a3e4a; }
+  aside button.primary { background: #ffd57a; color: #1a1d24; font-weight: 600; }
+  aside .file-zone { border: 1px dashed #3a3e4a; padding: 10px;
+                     border-radius: 4px; text-align: center; font-size: 12px;
+                     color: #8a8f99; cursor: pointer; }
+  aside .file-zone.over { border-color: #ffd57a; color: #ffd57a; }
+  section { display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 18px; }
+  .msg { margin: 0 0 14px; max-width: 80%; }
+  .msg .who { font-size: 11px; color: #8a8f99; margin-bottom: 4px;
+              text-transform: uppercase; letter-spacing: 0.05em; }
+  .msg.user { margin-left: auto; }
+  .msg.user .body { background: #2a4d8a; color: #fff; padding: 10px 14px;
+                    border-radius: 12px 12px 0 12px; }
+  .msg.assistant .body { background: #1a1d24; padding: 10px 14px;
+                         border-radius: 12px 12px 12px 0;
+                         border: 1px solid #2a2d36; }
+  .msg.system .body { font-style: italic; color: #8a8f99; font-size: 12px; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word;
+               font-family: -apple-system, sans-serif; font-size: 14px;
+               line-height: 1.5; }
+  .msg .body code { font-family: ui-monospace, monospace; font-size: 12px;
+                    background: rgba(255,255,255,0.06); padding: 1px 5px;
+                    border-radius: 3px; }
+  #composer { display: flex; gap: 8px; padding: 12px;
+              border-top: 1px solid #2a2d36; background: #14171f; }
+  #composer textarea { flex: 1; resize: none; background: #1a1d24;
+                       color: #e6e6e6; border: 1px solid #2a2d36;
+                       border-radius: 6px; padding: 10px; font-size: 14px;
+                       font-family: inherit; height: 60px; }
+  #composer button { background: #ffd57a; color: #1a1d24; border: 0;
+                     padding: 0 18px; border-radius: 6px; font-weight: 600;
+                     cursor: pointer; }
+  #composer button:disabled { opacity: 0.5; cursor: wait; }
+  /* composer toggles (multi-agent, writes) */
+  .ui-toggle { display: flex; flex-direction: column; align-items: center;
+               justify-content: center; gap: 4px; user-select: none;
+               font-size: 10px; color: #9aa4b2; letter-spacing: 0.04em;
+               text-transform: uppercase; white-space: nowrap; }
+  .ui-toggle .switch { position: relative; width: 40px; height: 22px; }
+  .ui-toggle input { opacity: 0; width: 0; height: 0; }
+  .ui-toggle .slider { position: absolute; inset: 0; cursor: pointer;
+               background: #2a2d36; border-radius: 22px;
+               transition: background 0.15s; }
+  .ui-toggle .slider::before { content: ""; position: absolute; height: 16px;
+               width: 16px; left: 3px; top: 3px; background: #e6e6e6;
+               border-radius: 50%; transition: transform 0.15s; }
+  .ui-toggle input:checked + .slider { background: #ffd57a; }
+  .ui-toggle input:checked + .slider::before { transform: translateX(18px);
+               background: #1a1d24; }
+  .ui-toggle .lbl { font-weight: 600; }
+  .ui-toggle.on .lbl { color: #ffd57a; }
+  /* writes toggle: red when ON, to signal it changes files on disk */
+  #wr-toggle input:checked + .slider { background: #e0733a; }
+  #wr-toggle.on .lbl { color: #e0733a; }
+  .download { display: inline-block; margin-top: 6px; color: #ffd57a;
+              text-decoration: none; font-weight: 600; font-size: 13px; }
+  .download:hover { text-decoration: underline; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+           font-size: 11px; background: #2a2d36; color: #8a8f99;
+           margin-right: 4px; }
+  .badge.ok { background: #1d4d2b; color: #79e29a; }
+  .badge.run { background: #4d3a1d; color: #ffd57a; }
+  .badge.err { background: #4d1d1d; color: #f08080; }
+  .code-block { margin: 8px 0; border-radius: 6px; overflow: hidden;
+                border: 1px solid #2a2d36; }
+  .code-block pre { margin: 0; padding: 10px 12px; background: #0d1117;
+                    font-family: ui-monospace, 'Cascadia Code', monospace;
+                    font-size: 12px; color: #c9d1d9; overflow-x: auto;
+                    white-space: pre; }
+  .code-block .cell-out { padding: 8px 12px; background: #161b22;
+                           font-family: ui-monospace, monospace; font-size: 12px;
+                           color: #8b949e; white-space: pre-wrap;
+                           border-top: 1px solid #21262d; }
+  .code-block .cell-out.err { color: #f08080; }
+  .code-block figure { margin: 0; padding: 8px; background: #fff;
+                       text-align: center; border-top: 1px solid #21262d; }
+  .code-block figure img { max-width: 100%; height: auto; border-radius: 4px; }
+
+  /* ---- agent thinking / progress panel ---- */
+  .think-wrap { border: 1px solid #2a2d36; border-radius: 8px; margin-top: 4px;
+                overflow: hidden; font-size: 12px; }
+  .think-header { display: flex; align-items: center; gap: 8px;
+                  padding: 7px 12px; background: #1a1d24; cursor: pointer;
+                  user-select: none; border-bottom: 1px solid #21262d; }
+  .think-header:hover { background: #21262d; }
+  .think-spinner { display: inline-block; font-size: 15px; color: #ffd57a;
+                   line-height: 1; }
+  .think-spinner.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .think-label { color: #8a8f99; flex: 1; font-size: 12px; }
+  .think-toggle { font-size: 10px; color: #8a8f99; }
+  .think-lines { max-height: 240px; overflow-y: auto; padding: 8px 12px;
+                 background: #0d1117; display: flex; flex-direction: column; gap: 2px; }
+  .think-lines.collapsed { display: none; }
+  .think-line { font-family: ui-monospace, 'Cascadia Code', monospace;
+                font-size: 11px; color: #8b949e; line-height: 1.5; }
+  .think-ok   { color: #79e29a; }
+  .think-err  { color: #f08080; }
+  .think-warn { color: #ffd57a; }
+  .think-tool { background: #21262d; border-radius: 3px; padding: 1px 5px;
+                color: #58a6ff; font-weight: 600; margin-right: 4px; font-size: 10px; }
+  .think-result { padding: 12px 14px; border-top: 1px solid #2a2d36;
+                  background: #14171f; font-size: 14px; line-height: 1.6;
+                  white-space: pre-wrap; word-wrap: break-word; }
+  .think-result .result-reply { margin-bottom: 8px; }
+  .think-result .result-step { font-size: 12px; margin: 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ds-agent</h1>
+  <span class="sid" id="sid">— no session —</span>
+  <button onclick="newSession()">New session</button>
+</header>
+<main>
+<aside>
+  <h2>Data file(s)</h2>
+  <div class="file-zone" id="dropzone">
+    Drop one or more data files here<br>
+    <span style="font-size:10px;color:#666">CSV · Excel · Parquet · JSON · NetCDF4 · NPY/NPZ · HDF5 · MATLAB · images · audio · PDF…</span>
+    <input type="file" id="filein" accept="*" multiple hidden>
+  </div>
+  <div class="row" id="datapath">—</div>
+
+  <h2>Target column</h2>
+  <input type="text" id="target" placeholder="e.g. price">
+  <button onclick="setTarget()">Set target</button>
+
+  <h2>Working directory</h2>
+  <input type="text" id="workdir" placeholder="/abs/path/to/output/dir">
+  <button onclick="setWorkDir()">Set working dir</button>
+  <div class="row" id="workdirShown">—</div>
+
+  <h2>Brief / instructions (optional)</h2>
+  <div class="file-zone" id="briefzone">
+    Drop PDF, Markdown, or TXT briefs here (multiple OK)
+    <input type="file" id="briefin" accept=".pdf,.md,.txt,.rst" multiple hidden>
+  </div>
+  <div class="row" id="briefname">—</div>
+
+  <h2>Session</h2>
+  <div class="row" id="state">—</div>
+  <div class="row" id="nb">—</div>
+</aside>
+
+<section>
+  <div id="log"></div>
+  <div id="composer">
+    <textarea id="input" placeholder="Try: 'build notebook' or 'what columns do I have?'"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
+    <label id="ma-toggle" class="ui-toggle on"
+           title="Multi-agent: an orchestrator delegates to specialist agents (data engineer, analyst, ML engineer, coder, researcher). Off = one faster single agent.">
+      <span class="switch">
+        <input type="checkbox" id="ma-checkbox" checked onchange="onMaToggle()">
+        <span class="slider"></span>
+      </span>
+      <span class="lbl">Multi-agent</span>
+    </label>
+    <label id="wr-toggle" class="ui-toggle"
+           title="File writes: ON applies the agent's file edits/writes to disk. OFF (default) only suggests them as diffs — nothing is written. Reads and searches always work.">
+      <span class="switch">
+        <input type="checkbox" id="wr-checkbox" onchange="onWrToggle()">
+        <span class="slider"></span>
+      </span>
+      <span class="lbl">Writes</span>
+    </label>
+    <button id="sendbtn" onclick="send()">Send</button>
+  </div>
+</section>
+</main>
+
+<script>
+let SID = null;
+
+function el(id) { return document.getElementById(id); }
+function api(p) { return p.startsWith('/') ? p : '/' + p; }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── multi-agent toggle (per-message flag sent to the API) ──
+function maEnabled() {
+  const cb = el('ma-checkbox');
+  return cb ? cb.checked : true;
+}
+function onMaToggle() {
+  const on = maEnabled();
+  el('ma-toggle').classList.toggle('on', on);
+  try { localStorage.setItem('ds_multiagent', on ? '1' : '0'); } catch (e) {}
+  addMsg('system', on
+    ? 'Multi-agent ON — orchestrator will delegate to specialist agents.'
+    : 'Multi-agent OFF — using the single-agent loop (faster).');
+}
+function restoreMaToggle() {
+  let on = true;
+  try { const v = localStorage.getItem('ds_multiagent'); if (v !== null) on = v === '1'; }
+  catch (e) {}
+  const cb = el('ma-checkbox');
+  if (cb) { cb.checked = on; el('ma-toggle').classList.toggle('on', on); }
+}
+
+// ── file-write mode toggle (Suggest by default, Write when ON) ──
+function writesEnabled() {
+  const cb = el('wr-checkbox');
+  return cb ? cb.checked : false;
+}
+function onWrToggle() {
+  const on = writesEnabled();
+  el('wr-toggle').classList.toggle('on', on);
+  try { localStorage.setItem('ds_allow_writes', on ? '1' : '0'); } catch (e) {}
+  addMsg('system', on
+    ? 'File writes ENABLED — the agent will apply edits and writes to disk (confined to the working directory).'
+    : 'File writes OFF — the agent will only suggest edits as diffs; nothing is written.');
+}
+function restoreWrToggle() {
+  let on = false;   // safe default: suggest only
+  try { const v = localStorage.getItem('ds_allow_writes'); if (v !== null) on = v === '1'; }
+  catch (e) {}
+  const cb = el('wr-checkbox');
+  if (cb) { cb.checked = on; el('wr-toggle').classList.toggle('on', on); }
+}
+
+async function newSession() {
+  const r = await fetch('/chat/sessions', {method: 'POST'});
+  const j = await r.json();
+  SID = j.session_id;
+  el('sid').textContent = 'sid: ' + SID;
+  el('log').innerHTML = '';
+  addMsg('system', 'Session ' + SID + ' ready. Drop a CSV, set the target, then ask me to build a notebook.');
+  refreshState();
+}
+
+function addMsg(who, text, html) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + who;
+  const w = document.createElement('div');
+  w.className = 'who';
+  w.textContent = who;
+  const b = document.createElement('div');
+  b.className = 'body';
+  if (html) b.innerHTML = html; else b.textContent = text;
+  d.appendChild(w);
+  d.appendChild(b);
+  el('log').appendChild(d);
+  el('log').scrollTop = el('log').scrollHeight;
+  return b;
+}
+
+async function send() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const txt = el('input').value.trim();
+  if (!txt) return;
+  el('input').value = '';
+  addMsg('user', txt);
+  el('sendbtn').disabled = true;
+  const bubble = addMsg('assistant', '');
+  bubble.innerHTML = buildThinkingBox();
+  const thinkBox = bubble.querySelector('.think-lines');
+
+  try {
+    const r = await fetch(`/chat/sessions/${SID}/message`,
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({text: txt, multiagent: maEnabled(),
+                             allow_writes: writesEnabled()})});
+    const j = await r.json();
+    const reenable = () => { el('sendbtn').disabled = false; };
+    if (j.job_id && j.stream) {
+      openStream(j.stream, thinkBox, j.job_id, bubble, reenable);
+    } else if (j.job_id) {
+      appendThink(thinkBox, 'Waiting for job…', '');
+      pollAndRender(j.job_id, bubble, reenable);
+    } else {
+      bubble.textContent = j.reply || JSON.stringify(j, null, 2);
+      refreshState();
+      reenable();
+    }
+  } catch (e) {
+    bubble.textContent = 'error: ' + e;
+    el('sendbtn').disabled = false;
+  }
+}
+
+function buildThinkingBox() {
+  return `<div class="think-wrap">
+    <div class="think-header" onclick="toggleThinkLines(this)">
+      <span class="think-spinner spinning">⟳</span>
+      <span class="think-label">Agent thinking…</span>
+      <span class="think-toggle">▲ hide</span>
+    </div>
+    <div class="think-lines"></div>
+  </div>`;
+}
+
+function toggleThinkLines(header) {
+  const lines = header.nextElementSibling;
+  const tog = header.querySelector('.think-toggle');
+  if (lines.classList.contains('collapsed')) {
+    lines.classList.remove('collapsed');
+    tog.textContent = '▲ hide';
+  } else {
+    lines.classList.add('collapsed');
+    tog.textContent = '▼ show';
+  }
+}
+
+function appendThink(box, msg, tool, level) {
+  const d = document.createElement('div');
+  d.className = 'think-line' + (level === 'error' ? ' think-err' : level === 'ok' ? ' think-ok' : level === 'warn' ? ' think-warn' : '');
+  const toolTag = tool ? `<span class="think-tool">[${tool}]</span> ` : '';
+  d.innerHTML = toolTag + esc(msg);
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+
+function openStream(streamUrl, thinkBox, jobId, bubble, onDone) {
+  const es = new EventSource(streamUrl);
+  es.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'progress') {
+      appendThink(thinkBox, msg.message, msg.tool, msg.level);
+    } else if (msg.type === 'done') {
+      es.close();
+      _stopSpinner(bubble, 'Done — rendering result…', false);
+      pollAndRender(jobId, bubble, onDone);
+    }
+  };
+  es.onerror = () => {
+    es.close();
+    _stopSpinner(bubble, 'Stream closed — fetching result…', false);
+    pollAndRender(jobId, bubble, onDone);
+  };
+}
+
+function _stopSpinner(bubble, label, isErr) {
+  const spinner = bubble.querySelector('.think-spinner');
+  const lbl     = bubble.querySelector('.think-label');
+  if (spinner) {
+    spinner.classList.remove('spinning');
+    spinner.textContent = isErr ? '✗' : '✓';
+    spinner.style.color = isErr ? '#f08080' : '#79e29a';
+  }
+  if (lbl && label) lbl.textContent = label;
+}
+
+async function pollAndRender(jobId, bubble, onDone) {
+  // Job might still be in the process of being marked done; poll briefly.
+  let job = null;
+  for (let attempt = 0; attempt < 25; attempt++) {
+    await new Promise(r => setTimeout(r, 800));
+    try {
+      const r = await fetch(`/chat/sessions/${SID}/jobs/${jobId}`);
+      job = await r.json();
+    } catch (_) { continue; }
+    if (job.state === 'done' || job.state === 'failed') break;
+  }
+  if (!job) {
+    _stopSpinner(bubble, 'Could not fetch result', true);
+    if (onDone) onDone();
+    return;
+  }
+
+  if (job.state === 'failed') {
+    _stopSpinner(bubble, 'Job failed', true);
+    const errDiv = document.createElement('div');
+    errDiv.className = 'think-result';
+    errDiv.innerHTML = `<span class="badge err">failed</span><pre style="color:#f08080;white-space:pre-wrap;margin:6px 0">${esc(job.error || 'unknown error')}</pre>`;
+    bubble.appendChild(errDiv);
+    el('log').scrollTop = el('log').scrollHeight;
+    refreshState();
+    if (onDone) onDone();
+    return;
+  }
+
+  _stopSpinner(bubble, 'Done', false);
+
+  const res = job.result || {};
+  const result = document.createElement('div');
+  result.className = 'think-result';
+
+  // Goal
+  if (res.goal) {
+    const g = document.createElement('div');
+    g.style.cssText = 'color:#ffd57a;font-size:12px;margin-bottom:6px;font-weight:600';
+    g.textContent = '🎯 ' + res.goal;
+    result.appendChild(g);
+  }
+
+  // Steps summary (compact)
+  if (res.steps_run && res.steps_run.length) {
+    const stepsDiv = document.createElement('div');
+    stepsDiv.style.cssText = 'margin-bottom:8px';
+    for (const sr of res.steps_run) {
+      const icon = sr.success ? '✓' : '✗';
+      const cls  = sr.success ? 'ok' : 'err';
+      let stepHtml = `<div class="result-step"><span class="badge ${cls}">${icon} ${esc(sr.tool)}</span>`;
+      stepHtml += `<span style="color:#8a8f99"> ${sr.elapsed_s}s — ${esc(sr.reason)}</span></div>`;
+      if (sr.output_text && sr.output_text !== '(no output)') {
+        stepHtml += `<div class="code-block"><div class="cell-out${sr.success?'':' err'}">${esc(sr.output_text)}</div>`;
+        if (sr.figures && sr.figures.length) {
+          for (const fig of sr.figures)
+            stepHtml += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+        }
+        stepHtml += '</div>';
+      } else if (sr.figures && sr.figures.length) {
+        stepHtml += '<div class="code-block">';
+        for (const fig of sr.figures)
+          stepHtml += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+        stepHtml += '</div>';
+      }
+      stepsDiv.innerHTML += stepHtml;
+    }
+    result.appendChild(stepsDiv);
+  }
+
+  // Final synthesis reply
+  if (res.reply) {
+    const replyDiv = document.createElement('div');
+    replyDiv.className = 'result-reply';
+    replyDiv.style.cssText = 'padding:10px 14px;background:#1a1d24;border-radius:8px;border:1px solid #2a2d36;font-size:14px;line-height:1.6';
+    replyDiv.innerHTML = esc(res.reply).replace(/\n/g,'<br>');
+    result.appendChild(replyDiv);
+  }
+
+  // Notebook download link
+  if (res.notebook) {
+    const dl = document.createElement('div');
+    dl.style.marginTop = '8px';
+    dl.innerHTML = `<a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`
+      + `<br><span style="color:#8a8f99;font-size:12px">saved to ${esc(res.notebook)}</span>`;
+    result.appendChild(dl);
+  }
+
+  if (res.error) {
+    const eDiv = document.createElement('div');
+    eDiv.style.cssText = 'color:#f08080;margin-top:6px;font-size:13px';
+    eDiv.textContent = 'Error: ' + res.error;
+    result.appendChild(eDiv);
+  }
+
+  bubble.appendChild(result);
+  el('log').scrollTop = el('log').scrollHeight;
+  refreshState();
+  if (onDone) onDone();
+}
+
+async function pollJob(jid, ph) {
+  const tStart = Date.now();
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    const r = await fetch(`/chat/sessions/${SID}/jobs/${jid}`);
+    const j = await r.json();
+    const elapsed = ((Date.now() - tStart) / 1000).toFixed(0);
+    if (j.state === 'done') {
+      const res = j.result || {};
+      let html = `<span class="badge ok">done</span> ${elapsed}s<br>`;
+
+      // Goal line
+      if (res.goal) {
+        html += `<div style="color:#ffd57a;font-size:12px;margin:4px 0">🎯 ${esc(res.goal)}</div>`;
+      }
+
+      // Tool steps
+      if (res.steps_run && res.steps_run.length) {
+        html += '<div style="margin:6px 0">';
+        for (const sr of res.steps_run) {
+          const icon = sr.success ? '✓' : '✗';
+          const cls  = sr.success ? 'ok' : 'err';
+          html += `<div style="margin:2px 0;font-size:12px">`;
+          html += `<span class="badge ${cls}">${icon} ${sr.tool}</span>`;
+          html += `<span style="color:#8a8f99"> ${sr.elapsed_s}s — ${esc(sr.reason)}</span>`;
+          // output text
+          if (sr.output_text && sr.output_text !== '(no output)') {
+            html += `<div class="code-block"><div class="cell-out${sr.success?'':' err'}">${esc(sr.output_text)}</div>`;
+            // figures from this step
+            if (sr.figures && sr.figures.length) {
+              for (const fig of sr.figures)
+                html += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+            }
+            html += '</div>';
+          } else if (sr.figures && sr.figures.length) {
+            html += '<div class="code-block">';
+            for (const fig of sr.figures)
+              html += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Synthesis reply
+      if (res.reply) {
+        html += `<div style="margin-top:8px;padding:10px 14px;background:#1a1d24;border-radius:8px;border:1px solid #2a2d36;font-size:14px;line-height:1.6">`;
+        html += esc(res.reply).replace(/\n/g,'<br>');
+        html += '</div>';
+      }
+
+      // Notebook download
+      if (res.notebook) {
+        html += `<br><a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`;
+        html += `<br><span style="color:#8a8f99;font-size:12px">saved to ${res.notebook}</span>`;
+      }
+
+      if (res.error) html += `<br><span style="color:#f08080">Error: ${esc(res.error)}</span>`;
+
+      ph.innerHTML = html;
+      refreshState();
+      return;
+    }
+    if (j.state === 'failed') {
+      ph.innerHTML = `<span class="badge err">failed</span> ${elapsed}s<br><pre>${j.error || 'unknown error'}</pre>`;
+      return;
+    }
+    ph.innerHTML = `<span class="badge run">${j.state}</span> ${elapsed}s elapsed…`;
+  }
+}
+
+async function refreshState() {
+  if (!SID) return;
+  const r = await fetch(`/chat/sessions/${SID}`);
+  const j = await r.json();
+  el('datapath').textContent = j.data_path || '—';
+  el('briefname').textContent = j.brief_filename ? `${j.brief_filename} (${j.brief_chars} chars)` : '—';
+  el('state').innerHTML = `<b>target</b>: ${j.target || '—'}<br>`
+    + `<b>artifacts</b>: ${j.artifacts.length ? j.artifacts.join(', ') : '—'}`;
+  el('workdirShown').textContent = j.work_dir || '—';
+  el('nb').innerHTML = j.notebook_ready
+    ? `<a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`
+    : '<i style="color:#666">notebook not built</i>';
+}
+
+async function setWorkDir() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const p = el('workdir').value.trim();
+  if (!p) return;
+  const r = await fetch(`/chat/sessions/${SID}/workdir`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({path: p, create: true})});
+  const j = await r.json();
+  if (!r.ok) { addMsg('assistant', 'workdir failed: ' + (j.detail || 'error')); return; }
+  addMsg('assistant', `Working directory set to ${j.work_dir}.`);
+  refreshState();
+}
+
+async function setTarget() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const t = el('target').value.trim();
+  if (!t) return;
+  await fetch(`/chat/sessions/${SID}/message`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({text: `target is ${t}`})});
+  addMsg('user', `target is ${t}`);
+  addMsg('assistant', `Target set to ${t}.`);
+  refreshState();
+}
+
+function wireDrop(zoneId, inputId, uploadFn) {
+  const z = el(zoneId), i = el(inputId);
+  z.addEventListener('click', () => i.click());
+  z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
+  z.addEventListener('dragleave', () => z.classList.remove('over'));
+  z.addEventListener('drop', e => {
+    e.preventDefault(); z.classList.remove('over');
+    if (e.dataTransfer.files.length) uploadFn(e.dataTransfer.files);
+  });
+  i.addEventListener('change', () => { if (i.files.length) uploadFn(i.files); });
+}
+
+async function uploadData(files) {
+  if (!SID) { alert('Start a session first.'); return; }
+  const names = Array.from(files).map(f => f.name).join(', ');
+  addMsg('user', `uploading ${files.length} file(s): ${names}…`);
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const r = await fetch(`/chat/sessions/${SID}/upload`, {method: 'POST', body: fd});
+  const j = await r.json();
+  if (j.error || !r.ok) { addMsg('assistant', 'upload failed: ' + (j.detail || j.error)); return; }
+  addMsg('assistant', j.load_summary || `Uploaded ${names}. Say "build notebook" to start.`);
+  refreshState();
+}
+
+async function uploadBrief(files) {
+  if (!SID) { alert('Start a session first.'); return; }
+  const names = Array.from(files).map(f => f.name).join(', ');
+  addMsg('user', `uploading brief(s): ${names}…`);
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const r = await fetch(`/chat/sessions/${SID}/brief`, {method: 'POST', body: fd});
+  const j = await r.json();
+  let reply = `Read ${files.length} brief(s) (${j.brief_chars} chars total).`;
+  if (j.task_hint) reply += ` Task hint: ${j.task_hint}.`;
+  if (j.mentioned_target) reply += ` Mentioned target: ${j.mentioned_target}.`;
+  addMsg('assistant', reply);
+  refreshState();
+}
+
+wireDrop('dropzone', 'filein', uploadData);
+wireDrop('briefzone', 'briefin', uploadBrief);
+
+// restore the composer toggles from the last visit, then start a session
+restoreMaToggle();
+restoreWrToggle();
+newSession();
+</script>
+</body>
+</html>

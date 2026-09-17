@@ -1,0 +1,23 @@
+name: Retrain
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drift-and-retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Drift detection
+        run: python agent/monitoring/drift_detector.py
+      - name: Retrain pipeline
+        run: dvc repro
+      - name: MLflow metric gate
+        run: python deploy/mlflow_gate.py
