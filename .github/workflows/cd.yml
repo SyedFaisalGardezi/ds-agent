@@ -27,7 +27,9 @@ jobs:
       - name: DVC dry run
         run: dvc repro --dry
       - name: Integration tests
-        run: pytest tests/integration/
+        # Coverage is gated on the unit-test step; the integration tests alone
+        # cover a small part of the code.
+        run: pytest tests/integration/ --no-cov
       # Build only, to prove the sandbox image builds. Nothing is published from
       # CI, so the workflow needs no registry login.
       - name: Docker build
