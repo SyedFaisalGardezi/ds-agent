@@ -229,7 +229,7 @@ All numeric outputs pass through `_sanitize` (numpy scalars → Python, NaN/Inf 
 ## 10. Quick-start
 
 ```bash
-cd /Users/ishtiasyed/My_Data/IPAD_sharing/DS_agent/ds-agent
+cd ds-agent
 
 # 1. confirm Ollama + model
 ollama list | grep Qwen3.6

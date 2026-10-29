@@ -24,10 +24,11 @@ jobs:
         run: dvc repro --dry
       - name: Integration tests
         run: pytest tests/integration/
+      # Build only, to prove the image builds. Nothing is published from CI, so
+      # the workflow needs no registry login; see "Publishing the Docker image"
+      # in README.md to push an image to your own registry.
       - name: Docker build
-        run: docker build --target runtime -t ghcr.io/${{ github.repository_owner }}/ds-agent:${{ github.sha }} .
-      - name: Docker push
-        run: docker push ghcr.io/${{ github.repository_owner }}/ds-agent:${{ github.sha }}
+        run: docker build --target runtime -t ds-agent:${{ github.sha }} .
       - name: MLflow metric gate
         run: python deploy/mlflow_gate.py
         env:

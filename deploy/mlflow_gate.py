@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 
 import mlflow
@@ -16,7 +15,7 @@ def main() -> None:
     client = mlflow.MlflowClient()
 
     try:
-        champion = client.get_registered_model(MODEL_NAME)
+        client.get_registered_model(MODEL_NAME)   # raises when no model is registered yet
         champion_version = client.get_latest_versions(MODEL_NAME, stages=["Production"])[0]
         champion_run = client.get_run(champion_version.run_id)
         champion_metric = champion_run.data.metrics[PRIMARY_METRIC]

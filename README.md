@@ -144,9 +144,28 @@ Use Python 3.11. Generated custom Python requires Docker and the local sandbox
 image: `docker build -f docker/sandbox.Dockerfile -t ds-agent-sandbox:local .`.
 It runs with no network, read-only inputs, resource limits and scratch output;
 workspace artifacts require approval. There is no host-execution fallback.
-Custom Python variables do not persist between container calls; built-in tool
-state remains session-scoped. Notebook export records current results without
-silently retraining. It is not currently a complete executable training notebook.
+DataFrames and Series created in one container call are kept for later calls
+(new columns added to the loaded data are kept too); other objects are not.
+`build_notebook` exports the session's successful analysis steps as an `.ipynb`
+or `.py` file, re-runs them in the sandbox from the source data first, and
+proposes the file for approval.
+
+## Publishing the Docker image
+
+CI builds the image to check that it builds, but never pushes it, so the
+repository holds no registry credentials. To publish an image to your own
+registry, log in and push from your machine, for example with the GitHub
+Container Registry and a personal access token that has the `write:packages`
+scope:
+
+```bash
+docker build --target runtime -t ghcr.io/<your-user>/ds-agent:latest .
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <your-user> --password-stdin
+docker push ghcr.io/<your-user>/ds-agent:latest
+```
+
+Keep the token in an environment variable or a password manager, never in the
+repository or in `.env.example`.
 
 Supervised training reserves test rows before model selection, learns
 preprocessing within validation folds and exports the fitted preprocessing/model

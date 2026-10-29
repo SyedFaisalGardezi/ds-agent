@@ -10,12 +10,17 @@ type, and what a correct run must show:
     data by this module, never typed in by hand.
 
 The synthetic cases plant their signals with a fixed seed, so the right answer
-is known by construction and the data is identical on every run. The ACC case
-uses the real exercise data when it is present on this machine and is skipped
-otherwise.
+is known by construction and the data is identical on every run.
+
+A real-data case can be added without putting its data, location or answers in
+the repository: describe it in evals/private/real_case.json (ignored by git),
+or point DSAGENT_EVAL_REAL_CASE at such a file. See _real_spec for the format.
+The case is skipped when no such file exists.
 """
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +28,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ACC_DIR = Path("/Users/ishtiasyed/My_Data/Job_application/ACC_DS_interview/my_agent_work")
 SEED = 20260930
 
 
@@ -44,7 +48,7 @@ class Fact:
 @dataclass
 class Finding:
     """Something a good analysis must surface. `entity` is the text that has
-    to appear in the reply (an id such as PRV020, or a column name)."""
+    to appear in the reply (an id such as PRV901, or a column name)."""
     entity: str
     why: str
     facts: list[Fact] = field(default_factory=list)
@@ -96,32 +100,50 @@ def _ratio_fact(label: str, ratio: float) -> Fact:
     return Fact(label, [ratio, (ratio - 1) * 100, ratio - 1], rel_tol=0.06)
 
 
-# ── case 1: the ACC fraud exercise (real data, no labels) ─────────────────────
+# ── case 1: a private real-data case, described outside the repository ─────
 
-def _build_acc(ws: Path) -> Expected:
-    for f in ["medical_claims_dataset.csv", "Candidate Exercise - Data Scientist.pdf",
-              "data_dictionary.pdf"]:
-        (ws / f).write_bytes((ACC_DIR / f).read_bytes())
-    df = pd.read_csv(ws / "medical_claims_dataset.csv")
-    paid = df.groupby("provider_id").paid_amount.sum()
-    prv014 = df[df.provider_id == "PRV014"]
+REAL_CASE_FILE = Path(os.environ.get(
+    "DSAGENT_EVAL_REAL_CASE", Path(__file__).parent / "private" / "real_case.json"))
+
+# Facts computed from the real data by name, so the private file holds only
+# which entity matters and why, never the numbers themselves.
+_REAL_FACTS: dict[str, Callable[[pd.DataFrame, str], Fact]] = {
+    "share_paid": lambda df, e: _share_fact(
+        "share of total paid", _share(df.groupby("provider_id").paid_amount.sum(), e)),
+    "lines_per_visit": lambda df, e: Fact(
+        "service lines per visit", [_lines_per_visit(df, e)], rel_tol=0.06),
+    "price_ratio": lambda df, e: _ratio_fact("price vs peer median", _price_ratio(df, e)),
+    "distinct_clients": lambda df, e: Fact(
+        "distinct clients", [float(df[df.provider_id == e].client_id.nunique())]),
+}
+
+
+def _real_spec() -> dict | None:
+    """The private case description, or None. Format:
+    {"data_dir": "...", "files": ["data.csv", "brief.pdf"], "data_file": "data.csv",
+     "request": "...", "task_types": [...], "target": "",
+     "questions": [["phrase", ...], ...], "audiences": [...],
+     "findings": [{"entity": "...", "why": "...", "facts": ["share_paid", ...]}]}"""
+    try:
+        spec = json.loads(REAL_CASE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    return spec if Path(spec.get("data_dir", "")).is_dir() else None
+
+
+def _build_real(ws: Path) -> Expected:
+    spec = _real_spec()
+    if spec is None:
+        raise FileNotFoundError(f"no usable real case at {REAL_CASE_FILE}")
+    for f in spec["files"]:
+        (ws / f).write_bytes((Path(spec["data_dir"]) / f).read_bytes())
+    df = pd.read_csv(ws / spec["data_file"])
     return Expected(
-        task_types={"exploratory_analysis", "anomaly_detection", "clustering"},
-        target="",
-        questions=[["exploratory analysis", "key findings"],
-                   ["populations of payments", "present a risk"],
-                   ["future instances", "long-term solution", "long term solution"],
-                   ["recommendations", "stakeholders"]],
-        audiences=["data analyst", "fraud investigator", "senior decision maker"],
-        findings=[
-            Finding("PRV020", "far more claims and service lines per visit than any peer",
-                    [_share_fact("share of total paid", _share(paid, "PRV020")),
-                     Fact("service lines per visit", [_lines_per_visit(df, "PRV020")],
-                          rel_tol=0.06)]),
-            Finding("PRV014", "prices well above peers, concentrated on a handful of clients",
-                    [_ratio_fact("price vs peer median", _price_ratio(df, "PRV014")),
-                     Fact("distinct clients", [float(prv014.client_id.nunique())])]),
-        ])
+        task_types=set(spec["task_types"]), target=spec.get("target", ""),
+        questions=spec["questions"], audiences=spec["audiences"],
+        findings=[Finding(f["entity"], f["why"],
+                          [_REAL_FACTS[k](df, f["entity"]) for k in f.get("facts", [])])
+                  for f in spec["findings"]])
 
 
 # ── case 2: synthetic provider claims with planted billing anomalies ─────────
@@ -267,10 +289,10 @@ def _build_churn(ws: Path) -> Expected:
 
 
 CASES: list[Case] = [
-    Case("acc_claims", "ACC fraud exercise, real data, no labels",
-         "Look into documents and data at working directory and based on "
-         "instructions plan the whole work and complete EDA",
-         _build_acc, available=lambda: ACC_DIR.is_dir()),
+    Case("real_case", "Private real-data case (configured outside the repository)",
+         (_real_spec() or {}).get("request", "Read the brief, plan the work and complete "
+                                             "the EDA."),
+         _build_real, available=lambda: _real_spec() is not None),
     Case("synthetic_claims", "Planted over-servicing and over-pricing, no labels",
          "Read the brief, plan the work and complete the EDA.", _build_claims),
     Case("synthetic_churn", "Labelled churn data with planted drivers",

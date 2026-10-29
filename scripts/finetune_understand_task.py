@@ -115,7 +115,6 @@ def _resolve_mlx_model_path(base_model: str, output_dir: Path) -> str:
       4. Ollama model name (e.g. "model:tag") — locate the GGUF blob in
          ~/.ollama/models/ and treat as case 3.
     """
-    import subprocess  # noqa: PLC0415
 
     p = Path(base_model)
 
@@ -571,7 +570,7 @@ def _quick_test(base_model: str, records: list[dict], backend: str) -> None:
 
     if backend == "mlx":
         try:
-            from mlx_lm import load, generate  # noqa: PLC0415
+            from mlx_lm import generate, load  # noqa: PLC0415
             model, tokenizer = load(base_model)
             prompt = tokenizer.apply_chat_template(
                 prompt_msgs, tokenize=False, add_generation_prompt=True

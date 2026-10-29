@@ -1449,7 +1449,7 @@ def _grounded_reply(draft, steps, llm_client):
 
 
 # A number as written in prose or tool output: 7,733 / 637263.45 / -1.7 / 47%.
-# Not part of an identifier, so PRV020 or claim_id2 do not count as figures.
+# Not part of an identifier, so PRV901 or claim_id2 do not count as figures.
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_.])-?\d[\d,]*(?:\.\d+)?%?(?![A-Za-z0-9_])")
 _FILE_RE = re.compile(r"\b[\w\-]+\.(?:csv|png|xlsx|parquet|json|pkl|joblib|ipynb|html|pdf|txt|md)\b",
                       re.IGNORECASE)

@@ -134,7 +134,7 @@ def main() -> None:
 
     # --- 8. leaderboard -----------------------------------------------
     banner("8. Leaderboard")
-    metric = ("accuracy" if r["status"] != "error"
+    _metric = ("accuracy" if r["status"] != "error"
               and "accuracy" in _post("/pipelines/task",
                                       {"records": recs,
                                        "target": args.target})["data"].get(

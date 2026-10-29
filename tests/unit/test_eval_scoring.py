@@ -28,25 +28,25 @@ from evals.scoring import (
 
 
 def test_numbers_ignore_identifiers():
-    assert numbers("PRV020 holds 47% of spend, 6.01 lines per visit, 1,234.5 NZD") == [
+    assert numbers("PRV901 holds 47% of spend, 6.01 lines per visit, 1,234.5 NZD") == [
         47.0, 6.01, 1234.5]
 
 
 def test_facts_are_matched_in_the_sentence_that_names_the_entity():
     share = Fact("share", [0.47, 47.0])
-    assert fact_found("PRV020 accounts for 47.2% of all payments.", "PRV020", share)
-    assert fact_found("| PRV020 | 0.47 | high |", "PRV020", share)
+    assert fact_found("PRV901 accounts for 47.2% of all payments.", "PRV901", share)
+    assert fact_found("| PRV901 | 0.47 | high |", "PRV901", share)
     # The right number next to a different provider does not count.
-    assert not fact_found("PRV020 is large. PRV014 accounts for 47%.", "PRV020", share)
-    assert not fact_found("PRV020 accounts for 30% of payments.", "PRV020", share)
+    assert not fact_found("PRV901 is large. PRV902 accounts for 47%.", "PRV901", share)
+    assert not fact_found("PRV901 accounts for 30% of payments.", "PRV901", share)
 
 
 def test_ratio_facts_accept_the_usual_ways_of_saying_them():
     ratio = Fact("price", [1.79, 79.0, 0.79], rel_tol=0.06)
-    for text in ("PRV014 charges 1.8x the peer median.",
-                 "PRV014 bills 78% above its peers.",
-                 "PRV014 prices are 0.8 above the median ratio."):
-        assert fact_found(text, "PRV014", ratio), text
+    for text in ("PRV902 charges 1.8x the peer median.",
+                 "PRV902 bills 78% above its peers.",
+                 "PRV902 prices are 0.8 above the median ratio."):
+        assert fact_found(text, "PRV902", ratio), text
 
 
 def _expected():

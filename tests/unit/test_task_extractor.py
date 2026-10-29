@@ -435,7 +435,7 @@ _ACC_LIKE_REPLY = json.dumps({
     "deliverables": ["Summary of findings", "Code and working"],
     "audiences": ["data analyst", "fraud investigator", "senior decision maker"],
     "constraints": ["Disclose any AI use and the prompts used"],
-    "data_notes": ["paid_amount: amount ACC paid"],
+    "data_notes": ["paid_amount: amount the insurer paid"],
     "task_type": "exploratory_analysis",
     "target_column": "",
     "aggregation_key": "Provider_ID",
@@ -491,7 +491,7 @@ def test_understand_task_uses_the_brief_reading_and_keeps_questions():
     from agent.api.agent_tools import UnderstandTaskTool
     from agent.api.sessions import Session
     session = Session("s")
-    session.brief = "Candidate exercise brief"
+    session.brief = "Exercise brief"
     df = pd.DataFrame({"provider_id": ["P1", "P2"] * 10, "paid_amount": range(20)})
     kernel = SimpleNamespace(namespace={"df": df})
     llm = MagicMock()

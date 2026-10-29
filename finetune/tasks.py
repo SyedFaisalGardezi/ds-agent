@@ -13,7 +13,7 @@ seeded generator, so task `seed` is reproducible.
 
 Contamination guard: training tasks never reuse the evaluation's data, ids or
 brief text. Provider ids here are drawn from other prefixes than the eval's
-PRV1xx, seeds start at 1,000 (the eval uses one fixed seed), and the real ACC
+PRV1xx, seeds start at 1,000 (the eval uses one fixed seed), and private real data
 data is never used. `assert_disjoint_from_eval` checks this for every task.
 """
 from __future__ import annotations

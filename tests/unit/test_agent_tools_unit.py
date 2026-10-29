@@ -203,7 +203,7 @@ def test_infer_target_llm_fallback():
 def test_infer_target_rejects_date_and_id_as_unlabelled():
     """All candidates are a date or an identifier → fail loudly, set no target.
 
-    This is the ACC case: service_date must never become the target, and the
+    This is the unlabelled claims case: service_date must never become the target, and the
     reply must steer to unsupervised methods rather than invent a label.
     """
     k = SessionKernel()

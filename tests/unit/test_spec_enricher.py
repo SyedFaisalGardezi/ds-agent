@@ -255,7 +255,7 @@ def test_enrich_unknown_task_type_becomes_binary(binary_df):
 # ── unlabelled data: never invent a target (review follow-up) ────────────────
 
 def _claims_like() -> pd.DataFrame:
-    """Shape of the ACC claims data: IDs, dates, categories, amounts, no label."""
+    """Shape of an unlabelled claims dataset: IDs, dates, categories, amounts, no label."""
     n = 60
     return pd.DataFrame({
         "claim_id": [f"CLM{i:05d}" for i in range(n)],

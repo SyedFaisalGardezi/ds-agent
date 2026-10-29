@@ -473,8 +473,8 @@ def _step(ok, text="", error="", artifacts=None, tool="execute_code"):
 
 def test_grounded_reply_keeps_supported_interpretation_and_drops_invented_figures():
     from agent.api.agent_runner import _grounded_reply
-    ev = _step(True, "PRV020 7733 4.211353\nPRV014 765 0.875512")
-    draft = ("PRV020 filed 7,733 claims, 4.2 SD above the mean, which suggests overservicing.\n"
+    ev = _step(True, "PRV901 7733 4.211353\nPRV902 765 0.875512")
+    draft = ("PRV901 filed 7,733 claims, 4.2 SD above the mean, which suggests overservicing.\n"
              "The model reached an AUC of 0.97.")
     out = _grounded_reply(draft, [ev], None)
     assert "overservicing" in out and "7,733" in out     # interpretation survives
@@ -546,7 +546,7 @@ def test_agent_written_plans_are_recognised_and_marked():
               "choices are assumptions to be tested._\n")
     assert is_agent_generated_doc(legacy)
     assert is_agent_generated_doc(AGENT_PLAN_MARKER + "\n# Analysis plan\n")
-    assert not is_agent_generated_doc("Candidate exercise: find provider billing anomalies.")
+    assert not is_agent_generated_doc("Exercise: find provider billing anomalies.")
 
 
 def _planning_kernel(plan_first, plan=None):
@@ -623,12 +623,12 @@ def test_agenda_merges_revised_plans_without_losing_answers():
     sync_agenda(ns, {"eda_questions_task": ["Which providers bill most?"],
                      "eda_questions_independent": ["Any duplicate claims?"]})
     assert [a["id"] for a in ns["EDA_AGENDA"]] == ["Q1", "Q2"]
-    assert record_findings(ns, ["q1"], "PRV020 holds 47% of spend") == ["Q1"]
+    assert record_findings(ns, ["q1"], "PRV901 holds 47% of spend") == ["Q1"]
     sync_agenda(ns, {"eda_questions_task": ["Which providers bill most?", "Paid vs allowed?"]})
     assert [(a["id"], a["status"]) for a in ns["EDA_AGENDA"]] == [
         ("Q1", "answered"), ("Q2", "open"), ("Q3", "open")]
-    assert add_lead(ns, "Why does PRV020 bill 6 lines per visit?") == "Q4"
-    assert add_lead(ns, "Why does PRV020 bill 6 lines per visit?") is None   # no duplicates
+    assert add_lead(ns, "Why does PRV901 bill 6 lines per visit?") == "Q4"
+    assert add_lead(ns, "Why does PRV901 bill 6 lines per visit?") is None   # no duplicates
     assert record_findings(ns, ["Q2"], "") == []                               # no empty findings
 
 
@@ -644,7 +644,7 @@ def test_agenda_is_shown_to_the_model_with_findings():
     from agent.api.agent_tools import record_findings, sync_agenda
     ns = {"WORK_PLAN": {"version": 1}}
     sync_agenda(ns, {"eda_questions_task": ["Which providers bill most?", "Paid vs allowed?"]})
-    record_findings(ns, ["Q1"], "PRV020 holds 47% of spend")
+    record_findings(ns, ["Q1"], "PRV901 holds 47% of spend")
     ctx = _data_context(Session("s"), SimpleNamespace(namespace=ns))
     assert "EDA AGENDA (1 of 2 answered)" in ctx
     assert "[Q2] (brief) Paid vs allowed?" in ctx and "47% of spend" in ctx
@@ -654,13 +654,13 @@ def test_critic_reports_settled_items_and_new_leads():
     from agent.api.agent_runner import _critique_step
     llm = Mock()
     llm._generate.return_value = json.dumps({
-        "verdict": "accept", "goal_met": False, "finding": "PRV020 bills 47% of spend",
-        "answers": ["Q1"], "new_question": "Why is PRV020 so large?", "next_step": "x",
+        "verdict": "accept", "goal_met": False, "finding": "PRV901 bills 47% of spend",
+        "answers": ["Q1"], "new_question": "Why is PRV901 so large?", "next_step": "x",
         "reason": "ok"})
     crit = _critique_step("explore", "execute_code", {}, "table", True, llm_client=llm,
                           repeats=1, agenda=[{"id": "Q1", "question": "Top billers?",
                                               "status": "open"}])
-    assert crit.answers == ["Q1"] and crit.new_question.startswith("Why is PRV020")
+    assert crit.answers == ["Q1"] and crit.new_question.startswith("Why is PRV901")
     assert "[Q1] Top billers?" in llm._generate.call_args.args[0]
 
 
@@ -671,12 +671,12 @@ def test_loop_records_critic_findings_on_the_agenda(monkeypatch):
     sync_agenda(ns, {"eda_questions_task": ["Top billers?"]})
     kernel = SimpleNamespace(task_intent=None, remaining_tool_calls=5, namespace=ns)
     tool = Mock(); tool.input_schema = {"type": "object"}; tool.description = "run code"
-    tool.execute.return_value = ToolOutput(True, "PRV020 47%")
+    tool.execute.return_value = ToolOutput(True, "PRV901 47%")
     monkeypatch.setitem(AR.TOOL_REGISTRY, "execute_code", tool)
     monkeypatch.setattr(AR, "_CRITIC_ENABLED", True)
     monkeypatch.setattr(AR, "_critique_step", lambda *a, **k: AR.Critique(
-        "accept", "", True, finding="PRV020 holds 47% of spend", answers=["Q1"],
-        new_question="Is PRV020 billing many lines per visit?"))
+        "accept", "", True, finding="PRV901 holds 47% of spend", answers=["Q1"],
+        new_question="Is PRV901 billing many lines per visit?"))
     llm = Mock()
     llm.chat_with_tools.return_value = {"content": "", "tool_calls": [
         {"function": {"name": "execute_code", "arguments": {"code": "print(1)"}}}]}
@@ -691,9 +691,9 @@ def test_reply_carries_the_stored_plan_and_agenda_coverage():
     from agent.api.agent_tools import record_findings, sync_agenda
     ns = {"WORK_PLAN": {"version": 2, "objective": "Find risky providers"}}
     sync_agenda(ns, {"eda_questions_task": ["Top billers?", "Paid vs allowed?"]})
-    record_findings(ns, ["Q1"], "PRV020")
+    record_findings(ns, ["Q1"], "PRV901")
     steps = [StepResult(1, "work_plan", {}, "", ToolOutput(True, "plan"), 0),
-             StepResult(2, "execute_code", {}, "", ToolOutput(True, "PRV020"), 0)]
+             StepResult(2, "execute_code", {}, "", ToolOutput(True, "PRV901"), 0)]
     out = _with_plan_and_agenda("Findings here.", steps, SimpleNamespace(namespace=ns))
     assert out.startswith("## Work plan (version 2)") and "Find risky providers" in out
     assert "## Results\n\nFindings here." in out
@@ -732,10 +732,10 @@ def _export_session(tmp_path):
           "TASK_SPEC": {"brief": {"objective": "Find risky providers",
                                   "questions": ["Which providers present a risk?"]}}}
     sync_agenda(ns, {"eda_questions_task": ["Top billers?", "Paid vs allowed?"]})
-    record_findings(ns, ["Q1"], "PRV020 holds 47% of spend")
+    record_findings(ns, ["Q1"], "PRV901 holds 47% of spend")
     kernel = SimpleNamespace(namespace=ns, analysis_cells=[
         {"code": "prov = df.groupby('provider_id').paid.sum()", "output": "", "figures": 0,
-         "finding": "PRV020 holds 47% of spend", "answers": ["Q1"]},
+         "finding": "PRV901 holds 47% of spend", "answers": ["Q1"]},
         {"code": "print(prov.head())", "output": "", "figures": 0, "finding": "", "answers": []}])
     return session, kernel
 

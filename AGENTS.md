@@ -16,10 +16,9 @@
 ## 0. Project Identity
 
 **Project name:** `ds-agent`
-**Working dir:** `/Users/ishtiasyed/My_Data/IPAD_sharing/DS_agent/ds-agent`
+**Working dir:** the repository root (`ds-agent/`)
 **Purpose:** Fully autonomous, locally-run AI agent acting as senior data scientist — connects to any data warehouse or database, runs the complete ML pipeline (ETL → deployment), explains every decision with mathematical rigour, exports to Power BI.
-**Owner:** Faisal (PhD, AI/ML — seismic signal processing, deep generative models)
-**Hardware:** MacBook Pro (MPS GPU available), remote HPC nodes via SSH (avida, raapoi, high01) managed by Slurm/PBS.
+**Hardware:** MacBook Pro (MPS GPU available), optional remote HPC nodes over SSH, managed by Slurm or PBS.
 **Python version:** 3.11 only.
 **Server:** `uvicorn agent.api.server:app --port 9090`
 
