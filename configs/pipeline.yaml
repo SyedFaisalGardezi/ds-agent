@@ -1,0 +1,5 @@
+# Reproducible demonstration. Set source_path/target/task_type for real data.
+source_path: tests/fixtures/pipeline.csv
+target: outcome
+task_type: regression
+models: [ridge]

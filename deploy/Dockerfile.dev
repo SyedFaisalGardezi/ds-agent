@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_SYSTEM_PYTHON=1 \
+    UV_LINK_MODE=copy
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates \
+        libgomp1 libsndfile1 libpq-dev \
+        graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv
+
+WORKDIR /workspace
+
+COPY pyproject.toml ./
+COPY agent ./agent
+
+RUN uv pip install --system -e ".[dev]" && \
+    uv pip install --system jupyterlab ipykernel ipywidgets
+
+EXPOSE 8888
+
+CMD ["sleep", "infinity"]

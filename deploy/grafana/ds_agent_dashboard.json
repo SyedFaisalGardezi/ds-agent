@@ -1,0 +1,11 @@
+{
+  "title": "DS Agent Dashboard",
+  "panels": [
+    {"title": "Request Latency (ms)", "type": "graph"},
+    {"title": "Prediction Throughput (req/s)", "type": "graph"},
+    {"title": "PSI Drift per Feature", "type": "graph"},
+    {"title": "Model Accuracy (rolling 7d)", "type": "stat"},
+    {"title": "Active Model Version", "type": "stat"},
+    {"title": "DQ Score History", "type": "graph"}
+  ]
+}

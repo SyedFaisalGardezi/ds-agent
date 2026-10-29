@@ -1,0 +1,124 @@
+x-dev-common: &dev-common
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.dev
+  image: ds-agent-dev:latest
+  working_dir: /workspace
+  volumes:
+    - ..:/workspace:cached
+    - dev_venv:/workspace/.venv_container
+    - dev_jupyter:/root/.jupyter
+  env_file: ../.env
+  environment:
+    OLLAMA_BASE_URL: http://host.docker.internal:11434
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHROMA_PATH: /workspace/.chroma
+    PYTHONPATH: /workspace
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  dev:
+    <<: *dev-common
+    container_name: ds-agent-dev
+    depends_on:
+      - mlflow
+      - chromadb
+      - redis
+    command: sleep infinity
+
+  jupyter:
+    <<: *dev-common
+    container_name: ds-agent-jupyter
+    depends_on:
+      - mlflow
+      - chromadb
+    ports:
+      - "8888:8888"
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --ServerApp.token=${JUPYTER_TOKEN:-dsagent}
+      --ServerApp.root_dir=/workspace
+
+  inference:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: runtime
+    ports:
+      - "8000:8000"
+    env_file: ../.env
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mlflow
+      - chromadb
+      - redis
+    profiles: ["prod"]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5001:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --backend-store-uri postgresql://mlflow:mlflow@postgres/mlflow
+      --default-artifact-root /mlruns
+    volumes:
+      - mlflow_artifacts:/mlruns
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    profiles: ["monitoring"]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana:/etc/grafana/provisioning/dashboards
+      - grafana_data:/var/lib/grafana
+    profiles: ["monitoring"]
+
+volumes:
+  dev_venv:
+  dev_jupyter:
+  postgres_data:
+  chroma_data:
+  mlflow_artifacts:
+  grafana_data:

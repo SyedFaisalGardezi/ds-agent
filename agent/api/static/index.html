@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ds-agent chat</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
+         background: #0f1115; color: #e6e6e6; height: 100vh; display: flex;
+         flex-direction: column; }
+  header { padding: 12px 18px; border-bottom: 1px solid #2a2d36;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; color: #ffd57a; }
+  header .sid { font-family: ui-monospace, monospace; font-size: 12px;
+                color: #8a8f99; }
+  header button { margin-left: auto; background: #ffd57a; color: #1a1d24;
+                  border: 0; padding: 6px 12px; border-radius: 4px;
+                  font-weight: 600; cursor: pointer; }
+  main { flex: 1; display: grid; grid-template-columns: 320px 1fr;
+         min-height: 0; }
+  aside { border-right: 1px solid #2a2d36; padding: 14px; overflow-y: auto;
+          background: #14171f; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+             color: #8a8f99; margin: 18px 0 8px; }
+  aside h2:first-child { margin-top: 0; }
+  aside .row { font-size: 13px; margin: 4px 0; word-break: break-word; }
+  aside .row b { color: #ffd57a; }
+  aside input[type=text] { width: 100%; padding: 6px 8px;
+                           background: #1a1d24; color: #e6e6e6;
+                           border: 1px solid #2a2d36; border-radius: 4px;
+                           font-size: 13px; }
+  aside button { margin-top: 6px; width: 100%; background: #2a2d36;
+                 color: #e6e6e6; border: 0; padding: 6px; border-radius: 4px;
+                 cursor: pointer; font-size: 12px; }
+  aside button:hover { background: #3a3e4a; }
+  aside button.primary { background: #ffd57a; color: #1a1d24; font-weight: 600; }
+  aside .file-zone { border: 1px dashed #3a3e4a; padding: 10px;
+                     border-radius: 4px; text-align: center; font-size: 12px;
+                     color: #8a8f99; cursor: pointer; }
+  aside .file-zone.over { border-color: #ffd57a; color: #ffd57a; }
+  section { display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 18px; }
+  .msg { margin: 0 0 14px; max-width: 80%; }
+  .msg .who { font-size: 11px; color: #8a8f99; margin-bottom: 4px;
+              text-transform: uppercase; letter-spacing: 0.05em; }
+  .msg.user { margin-left: auto; }
+  .msg.user .body { background: #2a4d8a; color: #fff; padding: 10px 14px;
+                    border-radius: 12px 12px 0 12px; }
+  .msg.assistant .body { background: #1a1d24; padding: 10px 14px;
+                         border-radius: 12px 12px 12px 0;
+                         border: 1px solid #2a2d36; }
+  .msg.system .body { font-style: italic; color: #8a8f99; font-size: 12px; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word;
+               font-family: -apple-system, sans-serif; font-size: 14px;
+               line-height: 1.5; }
+  .msg .body code { font-family: ui-monospace, monospace; font-size: 12px;
+                    background: rgba(255,255,255,0.06); padding: 1px 5px;
+                    border-radius: 3px; }
+  #composer { display: flex; gap: 8px; padding: 12px;
+              border-top: 1px solid #2a2d36; background: #14171f; }
+  #composer textarea { flex: 1; resize: none; background: #1a1d24;
+                       color: #e6e6e6; border: 1px solid #2a2d36;
+                       border-radius: 6px; padding: 10px; font-size: 14px;
+                       font-family: inherit; height: 60px; }
+  #composer button { background: #ffd57a; color: #1a1d24; border: 0;
+                     padding: 0 18px; border-radius: 6px; font-weight: 600;
+                     cursor: pointer; }
+  #composer button:disabled { opacity: 0.5; cursor: wait; }
+  /* composer toggles (multi-agent, writes) */
+  .ui-toggle { display: flex; flex-direction: column; align-items: center;
+               justify-content: center; gap: 4px; user-select: none;
+               font-size: 10px; color: #9aa4b2; letter-spacing: 0.04em;
+               text-transform: uppercase; white-space: nowrap; }
+  .ui-toggle .switch { position: relative; width: 40px; height: 22px; }
+  .ui-toggle input { opacity: 0; width: 0; height: 0; }
+  .ui-toggle .slider { position: absolute; inset: 0; cursor: pointer;
+               background: #2a2d36; border-radius: 22px;
+               transition: background 0.15s; }
+  .ui-toggle .slider::before { content: ""; position: absolute; height: 16px;
+               width: 16px; left: 3px; top: 3px; background: #e6e6e6;
+               border-radius: 50%; transition: transform 0.15s; }
+  .ui-toggle input:checked + .slider { background: #ffd57a; }
+  .ui-toggle input:checked + .slider::before { transform: translateX(18px);
+               background: #1a1d24; }
+  .ui-toggle .lbl { font-weight: 600; }
+  .ui-toggle.on .lbl { color: #ffd57a; }
+  /* writes toggle: red when ON, to signal it changes files on disk */
+  #wr-toggle input:checked + .slider { background: #e0733a; }
+  #wr-toggle.on .lbl { color: #e0733a; }
+  .download { display: inline-block; margin-top: 6px; color: #ffd57a;
+              text-decoration: none; font-weight: 600; font-size: 13px; }
+  .download:hover { text-decoration: underline; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+           font-size: 11px; background: #2a2d36; color: #8a8f99;
+           margin-right: 4px; }
+  .badge.ok { background: #1d4d2b; color: #79e29a; }
+  .badge.run { background: #4d3a1d; color: #ffd57a; }
+  .badge.err { background: #4d1d1d; color: #f08080; }
+  .code-block { margin: 8px 0; border-radius: 6px; overflow: hidden;
+                border: 1px solid #2a2d36; }
+  .code-block pre { margin: 0; padding: 10px 12px; background: #0d1117;
+                    font-family: ui-monospace, 'Cascadia Code', monospace;
+                    font-size: 12px; color: #c9d1d9; overflow-x: auto;
+                    white-space: pre; }
+  .code-block .cell-out { padding: 8px 12px; background: #161b22;
+                           font-family: ui-monospace, monospace; font-size: 12px;
+                           color: #8b949e; white-space: pre-wrap;
+                           border-top: 1px solid #21262d; }
+  .code-block .cell-out.err { color: #f08080; }
+  .code-block figure { margin: 0; padding: 8px; background: #fff;
+                       text-align: center; border-top: 1px solid #21262d; }
+  .code-block figure img { max-width: 100%; height: auto; border-radius: 4px; }
+
+  /* ---- agent thinking / progress panel ---- */
+  .think-wrap { border: 1px solid #2a2d36; border-radius: 8px; margin-top: 4px;
+                overflow: hidden; font-size: 12px; }
+  .think-header { display: flex; align-items: center; gap: 8px;
+                  padding: 7px 12px; background: #1a1d24; cursor: pointer;
+                  user-select: none; border-bottom: 1px solid #21262d; }
+  .think-header:hover { background: #21262d; }
+  .think-spinner { display: inline-block; font-size: 15px; color: #ffd57a;
+                   line-height: 1; }
+  .think-spinner.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .think-label { color: #8a8f99; flex: 1; font-size: 12px; }
+  .think-toggle { font-size: 10px; color: #8a8f99; }
+  .think-lines { max-height: 240px; overflow-y: auto; padding: 8px 12px;
+                 background: #0d1117; display: flex; flex-direction: column; gap: 2px; }
+  .think-lines.collapsed { display: none; }
+  .think-line { font-family: ui-monospace, 'Cascadia Code', monospace;
+                font-size: 11px; color: #8b949e; line-height: 1.5; }
+  .think-ok   { color: #79e29a; }
+  .think-err  { color: #f08080; }
+  .think-warn { color: #ffd57a; }
+  .think-tool { background: #21262d; border-radius: 3px; padding: 1px 5px;
+                color: #58a6ff; font-weight: 600; margin-right: 4px; font-size: 10px; }
+  /* Live seconds on the step in flight. A single model call can run for
+     minutes, and without this the log looks frozen. */
+  .think-elapsed { color: #6e7681; margin-left: 6px;
+                   font-variant-numeric: tabular-nums; }
+  .think-result { padding: 12px 14px; border-top: 1px solid #2a2d36;
+                  background: #14171f; font-size: 14px; line-height: 1.6;
+                  white-space: pre-wrap; word-wrap: break-word; }
+  .think-result .result-reply { margin-bottom: 8px; }
+  .think-result .result-step { font-size: 12px; margin: 2px 0; }
+</style>
+</head>
+<body>
+<style>
+  #login { position: fixed; inset: 0; background: #0f1116; display: flex;
+           align-items: center; justify-content: center; z-index: 1000; }
+  /* An ID selector outranks the browser's [hidden] rule, so state it here or
+     the overlay stays visible even when the hidden attribute is set. */
+  #login[hidden] { display: none !important; }
+  #login .card { background: #14171f; border: 1px solid #2a2d36;
+           border-radius: 12px; padding: 28px 26px; width: 340px; max-width: 90vw; }
+  #login h2 { margin: 0 0 4px; color: #ffd57a; }
+  #login .sub { color: #9aa4b2; font-size: 13px; margin: 0 0 16px; }
+  #login input { width: 100%; padding: 10px; margin-bottom: 10px; background: #1a1d24;
+           color: #e6e6e6; border: 1px solid #2a2d36; border-radius: 6px; font-size: 14px; }
+  #login button { width: 100%; padding: 10px; background: #ffd57a; color: #1a1d24;
+           border: 0; border-radius: 6px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+  #login button.link { background: none; color: #9aa4b2; font-weight: 400; }
+  #login .msg { font-size: 13px; color: #9aa4b2; min-height: 18px; margin-top: 4px; }
+  #login .msg.err { color: #e0808c; }
+  #login .msg.dev { color: #ffd57a; }
+  #whoami { font-size: 12px; color: #9aa4b2; margin-left: auto; margin-right: 10px; }
+  #whoami a { color: #9aa4b2; cursor: pointer; text-decoration: underline; }
+</style>
+<div id="login" hidden>
+  <div class="card">
+    <h2>ds-agent</h2>
+    <p class="sub">Sign in with your work email. We will send a verification code.</p>
+    <div id="login-email-step">
+      <input type="email" id="login-email" placeholder="you@company.com"
+             autocomplete="email"
+             onkeydown="if(event.key==='Enter')sendCode()">
+      <button onclick="sendCode()">Send code</button>
+    </div>
+    <div id="login-code-step" hidden>
+      <input type="text" id="login-code" placeholder="6-digit code" inputmode="numeric"
+             maxlength="6" onkeydown="if(event.key==='Enter')verifyCode()">
+      <button onclick="verifyCode()">Verify and sign in</button>
+      <button class="link" onclick="backToEmail()">Use a different email</button>
+    </div>
+    <div id="login-msg" class="msg"></div>
+  </div>
+</div>
+<header>
+  <h1>ds-agent</h1>
+  <span class="sid" id="sid">— no session —</span>
+  <span id="whoami"></span>
+  <button onclick="newSession()">New session</button>
+</header>
+<main>
+<aside>
+  <h2>Data file(s)</h2>
+  <div class="file-zone" id="dropzone">
+    Drop one or more data files here<br>
+    <span style="font-size:10px;color:#666">CSV · Excel · Parquet · JSON · NetCDF4 · NPY/NPZ · HDF5 · MATLAB · images · audio · PDF…</span>
+    <input type="file" id="filein" accept="*" multiple hidden>
+  </div>
+  <div class="row" id="datapath">—</div>
+
+  <h2>Target column</h2>
+  <input type="text" id="target" placeholder="e.g. price">
+  <button onclick="setTarget()">Set target</button>
+
+  <h2>Working directory</h2>
+  <input type="text" id="workdir" placeholder="/abs/path/to/output/dir">
+  <button onclick="setWorkDir()">Set working dir</button>
+  <div class="row" id="workdirShown">—</div>
+
+  <h2>Brief / instructions (optional)</h2>
+  <div class="file-zone" id="briefzone">
+    Drop PDF, Markdown, or TXT briefs here (multiple OK)
+    <input type="file" id="briefin" accept=".pdf,.md,.txt,.rst" multiple hidden>
+  </div>
+  <div class="row" id="briefname">—</div>
+
+  <h2>Pending changes</h2>
+  <div class="row" id="pendingBox">Nothing waiting. The agent never writes to
+    disk without your approval.</div>
+
+  <h2>Session</h2>
+  <div class="row" id="state">—</div>
+  <div class="row" id="nb">—</div>
+</aside>
+
+<section>
+  <div id="log"></div>
+  <div id="composer">
+    <textarea id="input" placeholder="Try: 'build notebook' or 'what columns do I have?'"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
+    <label id="ma-toggle" class="ui-toggle"
+           title="Multi-agent: an orchestrator delegates to specialist agents. OFF by default: a data-science pipeline is a dependency chain, and each handoff loses context — a specialist starts with only its sub-goal, and the final answer is written from truncated reports. ON is for breadth-first work with genuinely independent strands.">
+      <span class="switch">
+        <input type="checkbox" id="ma-checkbox" onchange="onMaToggle()">
+        <span class="slider"></span>
+      </span>
+      <span class="lbl">Multi-agent</span>
+    </label>
+    <label id="wr-toggle" class="ui-toggle"
+           title="File writes: ON lets the agent propose changes to disk, which wait in Pending changes for your approval. OFF (default) only suggests them as diffs. Nothing is written until you approve it. Reads and searches always work.">
+      <span class="switch">
+        <input type="checkbox" id="wr-checkbox" onchange="onWrToggle()">
+        <span class="slider"></span>
+      </span>
+      <span class="lbl">Writes</span>
+    </label>
+    <button id="sendbtn" onclick="send()">Send</button>
+  </div>
+</section>
+</main>
+
+<script>
+let SID = null;
+
+function el(id) { return document.getElementById(id); }
+function api(p) { return p.startsWith('/') ? p : '/' + p; }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── multi-agent toggle (per-message flag sent to the API) ──
+function maEnabled() {
+  const cb = el('ma-checkbox');
+  return cb ? cb.checked : false;
+}
+function onMaToggle() {
+  const on = maEnabled();
+  el('ma-toggle').classList.toggle('on', on);
+  // Key is versioned: anyone carrying the old 'ds_multiagent' = '1' would
+  // otherwise keep the orchestrator forever and the new default would look
+  // like it had never been applied.
+  try { localStorage.setItem('ds_multiagent_v2', on ? '1' : '0'); } catch (e) {}
+  addMsg('system', on
+    ? 'Multi-agent ON — an orchestrator delegates to specialist agents. Each handoff starts a fresh context, so use it for independent strands of work rather than a pipeline.'
+    : 'Multi-agent OFF — one agent, one continuous conversation. This is the default.');
+}
+function restoreMaToggle() {
+  let on = false;
+  try { const v = localStorage.getItem('ds_multiagent_v2'); if (v !== null) on = v === '1'; }
+  catch (e) {}
+  const cb = el('ma-checkbox');
+  if (cb) { cb.checked = on; el('ma-toggle').classList.toggle('on', on); }
+}
+
+// ── file-write mode toggle (Suggest by default, Write when ON) ──
+function writesEnabled() {
+  const cb = el('wr-checkbox');
+  return cb ? cb.checked : false;
+}
+function onWrToggle() {
+  const on = writesEnabled();
+  el('wr-toggle').classList.toggle('on', on);
+  try { localStorage.setItem('ds_allow_writes', on ? '1' : '0'); } catch (e) {}
+  addMsg('system', on
+    ? 'File writes ENABLED — the agent may now propose changes to disk. Each one waits in Pending changes for you to approve; nothing is written until you do.'
+    : 'File writes OFF — the agent will only suggest edits as diffs; nothing is written.');
+}
+function restoreWrToggle() {
+  let on = false;   // safe default: suggest only
+  try { const v = localStorage.getItem('ds_allow_writes'); if (v !== null) on = v === '1'; }
+  catch (e) {}
+  const cb = el('wr-checkbox');
+  if (cb) { cb.checked = on; el('wr-toggle').classList.toggle('on', on); }
+}
+
+async function newSession() {
+  const r = await fetch('/chat/sessions', {method: 'POST'});
+  const j = await r.json();
+  SID = j.session_id;
+  el('sid').textContent = 'sid: ' + SID;
+  el('log').innerHTML = '';
+  addMsg('system', 'Session ' + SID + ' ready. Drop a CSV, set the target, then ask me to build a notebook.');
+  refreshState();
+}
+
+function addMsg(who, text, html) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + who;
+  const w = document.createElement('div');
+  w.className = 'who';
+  w.textContent = who;
+  const b = document.createElement('div');
+  b.className = 'body';
+  if (html) b.innerHTML = html; else b.textContent = text;
+  d.appendChild(w);
+  d.appendChild(b);
+  el('log').appendChild(d);
+  el('log').scrollTop = el('log').scrollHeight;
+  return b;
+}
+
+async function send() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const txt = el('input').value.trim();
+  if (!txt) return;
+  el('input').value = '';
+  addMsg('user', txt);
+  el('sendbtn').disabled = true;
+  const bubble = addMsg('assistant', '');
+  bubble.innerHTML = buildThinkingBox();
+  const thinkBox = bubble.querySelector('.think-lines');
+
+  try {
+    const r = await fetch(`/chat/sessions/${SID}/message`,
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({text: txt, multiagent: maEnabled(),
+                             allow_writes: writesEnabled()})});
+    const j = await r.json();
+    const reenable = () => { el('sendbtn').disabled = false; };
+    if (j.job_id && j.stream) {
+      openStream(j.stream, thinkBox, j.job_id, bubble, reenable);
+    } else if (j.job_id) {
+      appendThink(thinkBox, 'Waiting for job…', '');
+      pollAndRender(j.job_id, bubble, reenable);
+    } else {
+      bubble.textContent = j.reply || JSON.stringify(j, null, 2);
+      refreshState();
+      reenable();
+    }
+  } catch (e) {
+    bubble.textContent = 'error: ' + e;
+    el('sendbtn').disabled = false;
+  }
+}
+
+function buildThinkingBox() {
+  return `<div class="think-wrap">
+    <div class="think-header" onclick="toggleThinkLines(this)">
+      <span class="think-spinner spinning">⟳</span>
+      <span class="think-label">Agent thinking…</span>
+      <span class="think-toggle">▲ hide</span>
+    </div>
+    <div class="think-lines"></div>
+  </div>`;
+}
+
+function toggleThinkLines(header) {
+  const lines = header.nextElementSibling;
+  const tog = header.querySelector('.think-toggle');
+  if (lines.classList.contains('collapsed')) {
+    lines.classList.remove('collapsed');
+    tog.textContent = '▲ hide';
+  } else {
+    lines.classList.add('collapsed');
+    tog.textContent = '▼ show';
+  }
+}
+
+function appendThink(box, msg, tool, level) {
+  const d = document.createElement('div');
+  d.className = 'think-line' + (level === 'error' ? ' think-err' : level === 'ok' ? ' think-ok' : level === 'warn' ? ' think-warn' : '');
+  const toolTag = tool ? `<span class="think-tool">[${tool}]</span> ` : '';
+  d.innerHTML = toolTag + esc(msg);
+  box.appendChild(d);
+  startElapsed(d);
+  box.scrollTop = box.scrollHeight;
+}
+
+// A single model call on a large local model can take a minute or more, and
+// between two progress events nothing moves. Ticking the seconds on the newest
+// line shows the run is alive and how long the current step has taken.
+let _elapsedTimer = null;
+function startElapsed(line) {
+  stopElapsed();
+  const span = document.createElement('span');
+  span.className = 'think-elapsed';
+  line.appendChild(span);
+  const t0 = Date.now();
+  _elapsedTimer = setInterval(() => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    span.textContent = s >= 3 ? `${s}s` : '';   // quiet for quick steps
+  }, 1000);
+}
+function stopElapsed() {
+  if (_elapsedTimer) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
+}
+
+function openStream(streamUrl, thinkBox, jobId, bubble, onDone) {
+  const es = new EventSource(streamUrl);
+  es.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'progress') {
+      appendThink(thinkBox, msg.message, msg.tool, msg.level);
+    } else if (msg.type === 'done') {
+      es.close();
+      stopElapsed();
+      _stopSpinner(bubble, 'Done — rendering result…', false);
+      pollAndRender(jobId, bubble, onDone);
+    }
+  };
+  es.onerror = () => {
+    es.close();
+    stopElapsed();
+    _stopSpinner(bubble, 'Progress stream closed — waiting for the result…', false);
+    pollAndRender(jobId, bubble, onDone);
+  };
+}
+
+// Wait for the job to finish. Long analyses run for many minutes, so this
+// must not give up while the job is still running: a fixed number of polls
+// used to end after 20 s and render an empty "Done" for a run that later
+// finished with a full answer. A job past its deadline ('timeout') is usually
+// finishing its last step, so it gets a grace period before we stop waiting.
+async function waitForJob(jobId, bubble) {
+  const lbl = bubble.querySelector('.think-label');
+  const t0 = Date.now();
+  let job = null, overdueSince = null, misses = 0;
+  while (true) {
+    await new Promise(r => setTimeout(r, job ? 2000 : 800));
+    try {
+      const r = await fetch(`/chat/sessions/${SID}/jobs/${jobId}`);
+      if (r.status === 404) return null;
+      job = await r.json();
+      misses = 0;
+    } catch (_) {
+      if (++misses > 30) return job;   // server unreachable for about a minute
+      continue;
+    }
+    if (job.state === 'done' || job.state === 'failed') return job;
+    if (job.state === 'timeout') {
+      overdueSince = overdueSince || Date.now();
+      if (Date.now() - overdueSince > 600000) return job;
+    }
+    if (lbl) lbl.textContent = `Still working… ${Math.round((Date.now() - t0) / 1000)}s`;
+  }
+}
+
+function _stopSpinner(bubble, label, isErr) {
+  const spinner = bubble.querySelector('.think-spinner');
+  const lbl     = bubble.querySelector('.think-label');
+  if (spinner) {
+    spinner.classList.remove('spinning');
+    spinner.textContent = isErr ? '✗' : '✓';
+    spinner.style.color = isErr ? '#f08080' : '#79e29a';
+  }
+  if (lbl && label) lbl.textContent = label;
+}
+
+async function pollAndRender(jobId, bubble, onDone) {
+  const job = await waitForJob(jobId, bubble);
+  if (!job) {
+    _stopSpinner(bubble, 'Could not fetch result', true);
+    if (onDone) onDone();
+    return;
+  }
+
+  if (job.state !== 'done') {
+    _stopSpinner(bubble, job.state === 'failed' ? 'Job failed' : 'Job did not finish', true);
+    const errDiv = document.createElement('div');
+    errDiv.className = 'think-result';
+    errDiv.innerHTML = `<span class="badge err">failed</span><pre style="color:#f08080;white-space:pre-wrap;margin:6px 0">${esc(job.error || 'unknown error')}</pre>`;
+    bubble.appendChild(errDiv);
+    el('log').scrollTop = el('log').scrollHeight;
+    refreshState();
+    if (onDone) onDone();
+    return;
+  }
+
+  _stopSpinner(bubble, 'Done', false);
+
+  const res = job.result || {};
+  const result = document.createElement('div');
+  result.className = 'think-result';
+
+  // Goal
+  if (res.goal) {
+    const g = document.createElement('div');
+    g.style.cssText = 'color:#ffd57a;font-size:12px;margin-bottom:6px;font-weight:600';
+    g.textContent = '🎯 ' + res.goal;
+    result.appendChild(g);
+  }
+
+  // Steps summary (compact)
+  if (res.steps_run && res.steps_run.length) {
+    const stepsDiv = document.createElement('div');
+    stepsDiv.style.cssText = 'margin-bottom:8px';
+    for (const sr of res.steps_run) {
+      const icon = sr.success ? '✓' : '✗';
+      const cls  = sr.success ? 'ok' : 'err';
+      let stepHtml = `<div class="result-step"><span class="badge ${cls}">${icon} ${esc(sr.tool)}</span>`;
+      stepHtml += `<span style="color:#8a8f99"> ${sr.elapsed_s}s — ${esc(sr.reason)}</span></div>`;
+      if (sr.output_text && sr.output_text !== '(no output)') {
+        stepHtml += `<div class="code-block"><div class="cell-out${sr.success?'':' err'}">${esc(sr.output_text)}</div>`;
+        if (sr.figures && sr.figures.length) {
+          for (const fig of sr.figures)
+            stepHtml += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+        }
+        stepHtml += '</div>';
+      } else if (sr.figures && sr.figures.length) {
+        stepHtml += '<div class="code-block">';
+        for (const fig of sr.figures)
+          stepHtml += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+        stepHtml += '</div>';
+      }
+      stepsDiv.innerHTML += stepHtml;
+    }
+    result.appendChild(stepsDiv);
+  }
+
+  // Final synthesis reply
+  if (res.reply) {
+    const replyDiv = document.createElement('div');
+    replyDiv.className = 'result-reply';
+    replyDiv.style.cssText = 'padding:10px 14px;background:#1a1d24;border-radius:8px;border:1px solid #2a2d36;font-size:14px;line-height:1.6';
+    replyDiv.innerHTML = esc(res.reply).replace(/\n/g,'<br>');
+    result.appendChild(replyDiv);
+  }
+
+  // Notebook download link
+  if (res.notebook) {
+    const dl = document.createElement('div');
+    dl.style.marginTop = '8px';
+    dl.innerHTML = `<a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`
+      + `<br><span style="color:#8a8f99;font-size:12px">saved to ${esc(res.notebook)}</span>`;
+    result.appendChild(dl);
+  }
+
+  if (res.error) {
+    const eDiv = document.createElement('div');
+    eDiv.style.cssText = 'color:#f08080;margin-top:6px;font-size:13px';
+    eDiv.textContent = 'Error: ' + res.error;
+    result.appendChild(eDiv);
+  }
+
+  bubble.appendChild(result);
+  el('log').scrollTop = el('log').scrollHeight;
+  refreshState();
+  if (onDone) onDone();
+}
+
+async function pollJob(jid, ph) {
+  const tStart = Date.now();
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    const r = await fetch(`/chat/sessions/${SID}/jobs/${jid}`);
+    const j = await r.json();
+    const elapsed = ((Date.now() - tStart) / 1000).toFixed(0);
+    if (j.state === 'done') {
+      const res = j.result || {};
+      let html = `<span class="badge ok">done</span> ${elapsed}s<br>`;
+
+      // Goal line
+      if (res.goal) {
+        html += `<div style="color:#ffd57a;font-size:12px;margin:4px 0">🎯 ${esc(res.goal)}</div>`;
+      }
+
+      // Tool steps
+      if (res.steps_run && res.steps_run.length) {
+        html += '<div style="margin:6px 0">';
+        for (const sr of res.steps_run) {
+          const icon = sr.success ? '✓' : '✗';
+          const cls  = sr.success ? 'ok' : 'err';
+          html += `<div style="margin:2px 0;font-size:12px">`;
+          html += `<span class="badge ${cls}">${icon} ${sr.tool}</span>`;
+          html += `<span style="color:#8a8f99"> ${sr.elapsed_s}s — ${esc(sr.reason)}</span>`;
+          // output text
+          if (sr.output_text && sr.output_text !== '(no output)') {
+            html += `<div class="code-block"><div class="cell-out${sr.success?'':' err'}">${esc(sr.output_text)}</div>`;
+            // figures from this step
+            if (sr.figures && sr.figures.length) {
+              for (const fig of sr.figures)
+                html += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+            }
+            html += '</div>';
+          } else if (sr.figures && sr.figures.length) {
+            html += '<div class="code-block">';
+            for (const fig of sr.figures)
+              html += `<figure><img src="data:image/png;base64,${fig}" alt="figure"></figure>`;
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Synthesis reply
+      if (res.reply) {
+        html += `<div style="margin-top:8px;padding:10px 14px;background:#1a1d24;border-radius:8px;border:1px solid #2a2d36;font-size:14px;line-height:1.6">`;
+        html += esc(res.reply).replace(/\n/g,'<br>');
+        html += '</div>';
+      }
+
+      // Notebook download
+      if (res.notebook) {
+        html += `<br><a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`;
+        html += `<br><span style="color:#8a8f99;font-size:12px">saved to ${res.notebook}</span>`;
+      }
+
+      if (res.error) html += `<br><span style="color:#f08080">Error: ${esc(res.error)}</span>`;
+
+      ph.innerHTML = html;
+      refreshState();
+      return;
+    }
+    if (j.state === 'failed') {
+      ph.innerHTML = `<span class="badge err">failed</span> ${elapsed}s<br><pre>${j.error || 'unknown error'}</pre>`;
+      return;
+    }
+    ph.innerHTML = `<span class="badge run">${j.state}</span> ${elapsed}s elapsed…`;
+  }
+}
+
+async function refreshState() {
+  if (!SID) return;
+  const r = await fetch(`/chat/sessions/${SID}`);
+  const j = await r.json();
+  el('datapath').textContent = j.data_path || '—';
+  el('briefname').textContent = j.brief_filename ? `${j.brief_filename} (${j.brief_chars} chars)` : '—';
+  el('state').innerHTML = `<b>target</b>: ${j.target || '—'}<br>`
+    + `<b>artifacts</b>: ${j.artifacts.length ? j.artifacts.join(', ') : '—'}`;
+  el('workdirShown').textContent = j.work_dir || '—';
+  el('nb').innerHTML = j.notebook_ready
+    ? `<a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`
+    : '<i style="color:#666">notebook not built</i>';
+  refreshPending();
+}
+
+// Disk changes the agent wants to make. They are staged, never applied, until
+// approved here.
+async function refreshPending() {
+  if (!SID) return;
+  let items = [];
+  try {
+    const r = await fetch(`/chat/sessions/${SID}/pending`);
+    items = (await r.json()).pending || [];
+  } catch (e) { return; }
+  const box = el('pendingBox');
+  if (!items.length) {
+    box.innerHTML = 'Nothing waiting. The agent never writes to disk without '
+      + 'your approval.';
+    return;
+  }
+  box.innerHTML = items.map(it => {
+    const dirs = (it.make_dirs || []).length
+      ? `<div style="color:#e0a030">creates ${it.make_dirs.length} new folder(s)</div>`
+      : '';
+    const diff = it.diff
+      ? `<pre style="max-height:140px;overflow:auto;font-size:11px;margin:4px 0">`
+        + escapeHtml(it.diff.slice(0, 1200)) + `</pre>`
+      : '';
+    return `<div style="border:1px solid #333;border-radius:6px;padding:8px;margin-bottom:8px">
+      <div><b>${escapeHtml(it.summary || it.rel || '')}</b></div>
+      <div style="color:#888;font-size:11px">${escapeHtml(it.rel || '')}</div>
+      ${dirs}${diff}
+      <button onclick="decidePending('apply', '${it.id}')">Approve</button>
+      <button onclick="decidePending('discard', '${it.id}')">Reject</button>
+    </div>`;
+  }).join('')
+    + `<button onclick="decidePending('apply', null)">Approve all</button>
+       <button onclick="decidePending('discard', null)">Reject all</button>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+async function decidePending(action, id) {
+  if (!SID) return;
+  const r = await fetch(`/chat/sessions/${SID}/pending/${action}`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({ids: id ? [id] : null})});
+  const j = await r.json();
+  if (action === 'apply') {
+    (j.applied || []).forEach(a => addMsg('assistant', `Applied: ${a.summary}`));
+    (j.failed || []).forEach(f => addMsg('assistant', `Failed: ${f.rel} (${f.error})`));
+  } else if (j.discarded) {
+    addMsg('assistant', `Rejected ${j.discarded} change(s). Nothing was written.`);
+  }
+  refreshPending();
+}
+
+async function setWorkDir() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const p = el('workdir').value.trim();
+  if (!p) return;
+  // create:false so a mistyped path is reported instead of being created as an
+  // empty directory that then becomes the workspace.
+  const r = await fetch(`/chat/sessions/${SID}/workdir`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({path: p, create: false})});
+  const j = await r.json();
+  if (!r.ok) { addMsg('assistant', 'workdir failed: ' + (j.detail || 'error')); return; }
+  // No full stop after the path: it used to be copied back into the box as part
+  // of the path, which is how an empty "<name>." directory got created.
+  const n = (j.workspace || {}).n_files || 0;
+  let msg = `Working directory set to ${j.work_dir}`;
+  if (n) {
+    msg += ` (${n} file${n === 1 ? '' : 's'} mapped)`;
+    if ((j.loaded_data || []).length) msg += `\nData loaded: ${j.loaded_data.join(', ')}`;
+    if ((j.loaded_briefs || []).length) msg += `\nBriefs loaded: ${j.loaded_briefs.join(', ')}`;
+  } else {
+    msg += '\n\nWARNING: this directory is empty. Check the path before running anything.';
+  }
+  addMsg('assistant', msg);
+  refreshState();
+}
+
+async function setTarget() {
+  if (!SID) { alert('Start a session first.'); return; }
+  const t = el('target').value.trim();
+  if (!t) return;
+  await fetch(`/chat/sessions/${SID}/message`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({text: `target is ${t}`})});
+  addMsg('user', `target is ${t}`);
+  addMsg('assistant', `Target set to ${t}.`);
+  refreshState();
+}
+
+function wireDrop(zoneId, inputId, uploadFn) {
+  const z = el(zoneId), i = el(inputId);
+  z.addEventListener('click', () => i.click());
+  z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
+  z.addEventListener('dragleave', () => z.classList.remove('over'));
+  z.addEventListener('drop', e => {
+    e.preventDefault(); z.classList.remove('over');
+    if (e.dataTransfer.files.length) uploadFn(e.dataTransfer.files);
+  });
+  i.addEventListener('change', () => { if (i.files.length) uploadFn(i.files); });
+}
+
+async function uploadData(files) {
+  if (!SID) { alert('Start a session first.'); return; }
+  const names = Array.from(files).map(f => f.name).join(', ');
+  addMsg('user', `uploading ${files.length} file(s): ${names}…`);
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const r = await fetch(`/chat/sessions/${SID}/upload`, {method: 'POST', body: fd});
+  const j = await r.json();
+  if (j.error || !r.ok) { addMsg('assistant', 'upload failed: ' + (j.detail || j.error)); return; }
+  addMsg('assistant', j.load_summary || `Uploaded ${names}. Say "build notebook" to start.`);
+  refreshState();
+}
+
+async function uploadBrief(files) {
+  if (!SID) { alert('Start a session first.'); return; }
+  const names = Array.from(files).map(f => f.name).join(', ');
+  addMsg('user', `uploading brief(s): ${names}…`);
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const r = await fetch(`/chat/sessions/${SID}/brief`, {method: 'POST', body: fd});
+  const j = await r.json();
+  let reply = `Read ${files.length} brief(s) (${j.brief_chars} chars total).`;
+  if (j.task_hint) reply += ` Task hint: ${j.task_hint}.`;
+  if (j.mentioned_target) reply += ` Mentioned target: ${j.mentioned_target}.`;
+  addMsg('assistant', reply);
+  refreshState();
+}
+
+wireDrop('dropzone', 'filein', uploadData);
+wireDrop('briefzone', 'briefin', uploadBrief);
+
+// restore the composer toggles from the last visit, then start a session
+// ── email verification-code login ──
+let AUTH_EMAIL = null;
+function loginMsg(text, cls) {
+  const m = el('login-msg');
+  m.textContent = text || '';
+  m.className = 'msg' + (cls ? ' ' + cls : '');
+}
+function setTokenCookie(t) {
+  document.cookie = 'ds_token=' + t + '; path=/; max-age=86400; samesite=lax';
+  try { localStorage.setItem('ds_token', t); } catch (e) {}
+}
+async function initAuth() {
+  let status;
+  try { status = await (await fetch('/auth/status')).json(); }
+  catch (e) { status = { auth_required: false }; }
+  if (status.auth_required && !status.user) {
+    el('login').hidden = false;
+    el('login-email').focus();
+    return;               // wait for sign-in before starting a session
+  }
+  if (status.user) {
+    el('whoami').innerHTML = 'Signed in as ' + esc(status.user.email) +
+      ' · <a onclick="logout()">Sign out</a>';
+  }
+  newSession();
+}
+async function sendCode() {
+  const email = el('login-email').value.trim();
+  if (!email) { loginMsg('Enter your email.', 'err'); return; }
+  AUTH_EMAIL = email;
+  loginMsg('Sending code...');
+  try {
+    const r = await (await fetch('/auth/request-code',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }) })).json();
+    el('login-email-step').hidden = true;
+    el('login-code-step').hidden = false;
+    el('login-code').focus();
+    if (r.dev_code) loginMsg('Dev mode: your code is ' + r.dev_code, 'dev');
+    else loginMsg('Code sent to ' + email + '. Check your email.');
+  } catch (e) { loginMsg('Could not send the code.', 'err'); }
+}
+async function verifyCode() {
+  const code = el('login-code').value.trim();
+  if (!code) { loginMsg('Enter the code.', 'err'); return; }
+  loginMsg('Verifying...');
+  try {
+    const res = await fetch('/auth/verify-code',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: AUTH_EMAIL, code }) });
+    if (!res.ok) { loginMsg('Invalid or expired code.', 'err'); return; }
+    const v = await res.json();
+    setTokenCookie(v.token);
+    el('login').hidden = true;
+    el('whoami').innerHTML = 'Signed in as ' + esc(v.user.email) +
+      ' · <a onclick="logout()">Sign out</a>';
+    newSession();
+  } catch (e) { loginMsg('Verification failed.', 'err'); }
+}
+function backToEmail() {
+  el('login-code-step').hidden = true;
+  el('login-email-step').hidden = false;
+  loginMsg('');
+}
+function logout() {
+  document.cookie = 'ds_token=; path=/; max-age=0';
+  try { localStorage.removeItem('ds_token'); } catch (e) {}
+  location.reload();
+}
+
+restoreMaToggle();
+restoreWrToggle();
+// Login is disabled for now. To re-enable email-code sign-in later, change the
+// next line back to initAuth() and start the server with DSAGENT_AUTH_ENABLED=1.
+newSession();
+</script>
+</body>
+</html>

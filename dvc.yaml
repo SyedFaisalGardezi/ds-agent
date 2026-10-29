@@ -1,0 +1,29 @@
+stages:
+  extract:
+    cmd: python -m agent.pipeline.cli extract
+    deps:
+      - agent/pipeline/cli.py
+      - configs/pipeline.yaml
+      - tests/fixtures/pipeline.csv
+    outs:
+      - outputs/datasets/raw.parquet
+
+  transform:
+    cmd: python -m agent.pipeline.cli transform
+    deps:
+      - agent/pipeline/cli.py
+      - outputs/datasets/raw.parquet
+    outs:
+      - outputs/datasets/clean.parquet
+
+  train:
+    cmd: python -m agent.pipeline.cli train
+    deps:
+      - agent/pipeline/cli.py
+      - agent/pipeline/model_builder/supervised.py
+      - configs/pipeline.yaml
+      - outputs/datasets/clean.parquet
+    outs:
+      - outputs/models/pipeline.joblib
+    metrics:
+      - outputs/reports/metrics.json

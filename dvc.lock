@@ -1,0 +1,66 @@
+schema: '2.0'
+stages:
+  extract:
+    cmd: python -m agent.pipeline.cli extract
+    deps:
+    - path: agent/pipeline/cli.py
+      hash: md5
+      md5: 641f330d934fcd8ca1df13027d3198cf
+      size: 1660
+    - path: configs/pipeline.yaml
+      hash: md5
+      md5: fde348cfc3a835e07e23ffe0e1992a30
+      size: 173
+    - path: tests/fixtures/pipeline.csv
+      hash: md5
+      md5: 6998202fdbd91b347ad8f0f347373e54
+      size: 614
+    outs:
+    - path: outputs/datasets/raw.parquet
+      hash: md5
+      md5: f6e447a319237b593f0ad1e33e47a2e3
+      size: 2788
+  transform:
+    cmd: python -m agent.pipeline.cli transform
+    deps:
+    - path: agent/pipeline/cli.py
+      hash: md5
+      md5: 641f330d934fcd8ca1df13027d3198cf
+      size: 1660
+    - path: outputs/datasets/raw.parquet
+      hash: md5
+      md5: f6e447a319237b593f0ad1e33e47a2e3
+      size: 2788
+    outs:
+    - path: outputs/datasets/clean.parquet
+      hash: md5
+      md5: f6e447a319237b593f0ad1e33e47a2e3
+      size: 2788
+  train:
+    cmd: python -m agent.pipeline.cli train
+    deps:
+    - path: agent/pipeline/cli.py
+      hash: md5
+      md5: 641f330d934fcd8ca1df13027d3198cf
+      size: 1660
+    - path: agent/pipeline/model_builder/supervised.py
+      hash: md5
+      md5: 1146cebc99d00fc8f9126852434d5dc9
+      size: 11666
+    - path: configs/pipeline.yaml
+      hash: md5
+      md5: fde348cfc3a835e07e23ffe0e1992a30
+      size: 173
+    - path: outputs/datasets/clean.parquet
+      hash: md5
+      md5: f6e447a319237b593f0ad1e33e47a2e3
+      size: 2788
+    outs:
+    - path: outputs/models/pipeline.joblib
+      hash: md5
+      md5: 9bfbd19498612ba4e5211612e57843f3
+      size: 3578
+    - path: outputs/reports/metrics.json
+      hash: md5
+      md5: 21e2d4ad3cf949728f69ba065f91f9cf
+      size: 60
