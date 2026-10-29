@@ -20,15 +20,18 @@ jobs:
         run: mypy agent/ --ignore-missing-imports
       - name: Unit tests
         run: pytest tests/unit/ -x --cov=agent --cov-fail-under=80
+      # A fresh checkout has no stage outputs yet, so run the pipeline before
+      # the dry run checks the declared stages (the same order as CI).
+      - name: Reproduce demonstration pipeline
+        run: dvc repro
       - name: DVC dry run
         run: dvc repro --dry
       - name: Integration tests
         run: pytest tests/integration/
-      # Build only, to prove the image builds. Nothing is published from CI, so
-      # the workflow needs no registry login; see "Publishing the Docker image"
-      # in README.md to push an image to your own registry.
+      # Build only, to prove the sandbox image builds. Nothing is published from
+      # CI, so the workflow needs no registry login.
       - name: Docker build
-        run: docker build --target runtime -t ds-agent:${{ github.sha }} .
+        run: docker build -f docker/sandbox.Dockerfile -t ds-agent-sandbox:${{ github.sha }} .
       - name: MLflow metric gate
         run: python deploy/mlflow_gate.py
         env:

@@ -149,15 +149,18 @@ dvc repro                     # reproducible demonstration pipeline on a synthet
 ```
 
 - **CI** (`.github/workflows/ci.yml`) runs lint, type checks, the tests, the DVC pipeline and schema validation on pull requests that change code or configuration.
-- **CD** (`cd.yml`) repeats those checks on `main` and builds the Docker image. It never pushes the image, so the repository holds no registry credentials.
+- **CD** (`cd.yml`) repeats those checks on `main`, runs the integration tests, and builds the sandbox image. It never pushes an image, so the repository holds no registry credentials.
 - **Retrain** (`retrain.yml`) runs weekly: drift detection, `dvc repro`, and an MLflow gate that promotes a challenger model only if it beats the current one by a set margin (`METRIC_GATE_MARGIN`, default 0.01).
 
-To publish the image to your own registry, push it from your machine with a personal access token held outside the repository:
+### Deploying a trained model
+
+The `deploy_model` tool packages a trained model as a FastAPI prediction service in a `deploy/` folder of your working directory (`app.py`, `Dockerfile`, `requirements.txt` and the serialised model), staged for your approval. To publish that service image to your own registry, build and push it from your machine with a token held outside the repository:
 
 ```bash
-docker build --target runtime -t ghcr.io/<your-user>/ds-agent:latest .
+cd deploy
+docker build -t ghcr.io/<your-user>/<model-service>:latest .
 echo "$GHCR_TOKEN" | docker login ghcr.io -u <your-user> --password-stdin
-docker push ghcr.io/<your-user>/ds-agent:latest
+docker push ghcr.io/<your-user>/<model-service>:latest
 ```
 
 ## Project layout
