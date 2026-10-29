@@ -99,11 +99,6 @@ causal = [
 streaming = [
   "confluent-kafka>=2.0,<3.0",
 ]
-finetune = [
-  "peft>=0.13,<1.0",
-  "trl>=0.12,<1.0",
-  "bitsandbytes>=0.45,<1.0",
-]
 bigquery = [
   "google-cloud-bigquery>=3.0,<4.0",
 ]

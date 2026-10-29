@@ -1,4 +1,4 @@
-"""Record every model call the agent makes, for evaluation and fine-tuning data.
+"""Record every model call the agent makes, for evaluation and debugging.
 
 Off by default. Set DSAGENT_TRACE_DIR to a folder and every call through the
 session's LLM client (`_generate`, `_chat`, `chat_with_tools`) is appended to
@@ -13,8 +13,7 @@ plan_approach, _critique_step -> critic, _tool_call_loop -> agent_turn, and so
 on. A call from anywhere else is recorded as "other:<function>".
 
 Traces contain whatever the model saw, including brief text and data samples.
-Keep tracing off for confidential data; the fine-tuning pipeline builds its
-dataset from synthetic tasks only.
+Keep tracing off for confidential data.
 """
 from __future__ import annotations
 

@@ -76,7 +76,7 @@ Latest results with `gpt-oss:20b` on an M1 Pro (32 GB), October 2026:
 | --- | --- |
 | Intent suite (15 requests) | 15 of 15 correct, in each of two runs |
 | Brief understanding, synthetic cases | 1.00 on both cases (task type, target, every question and audience) |
-| Unit tests | 1,386 passing, 82.7% line coverage |
+| Unit tests | 1,378 passing, 82.2% line coverage |
 
 ```bash
 .venv/bin/python -m evals.run_eval --stage intent      # about 15 minutes
@@ -186,3 +186,7 @@ docker/           Sandbox image
 - **Analysis depth:** the local model reliably finds strong planted patterns but can miss subtler ones. The hosted backend is available for comparison.
 - **The evidence check is numeric:** statements without numbers are not checked against output, and small whole numbers (up to 20) are skipped because they are usually counts.
 - **Docker is required** for any custom analysis code; without it the agent reports that code cannot run, rather than running it on the host.
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).
