@@ -16,6 +16,10 @@ import pandas as pd
 if TYPE_CHECKING:
     from agent.api.task_extractor import RawSpec
 
+# Task types with no label column: a target is never inferred for these.
+_UNSUPERVISED_TYPES = frozenset({"anomaly_detection", "clustering",
+                                 "exploratory_analysis"})
+
 
 @dataclass
 class EnrichedSpec:
@@ -71,9 +75,22 @@ class SpecEnricher:
         imbalance_ratio: float | None = None
 
         # ── 1. Resolve target column ──────────────────────────────────
-        if not target_col or target_col not in column_names:
+        # An unsupervised task has no label to find, and a named column that
+        # is a date, an identifier or a constant cannot be predicted. Either
+        # way the target stays empty rather than being invented.
+        if target_col and target_col in column_names and df is not None:
+            bad, why = self._unsuitable(df, target_col)
+            if bad:
+                notes.append(f"Named target '{target_col}' rejected: {why}")
+                target_col = ""
+        if task_type in _UNSUPERVISED_TYPES:
+            if target_col:
+                notes.append(f"Target '{target_col}' ignored: {task_type} has no label")
+            target_col = ""
+        elif not target_col or target_col not in column_names:
             target_col, reason = self._infer_target_from_data(df, column_names)
-            notes.append(f"Target auto-detected: {target_col} ({reason})")
+            notes.append(f"Target auto-detected: {target_col} ({reason})"
+                         if target_col else f"No target: {reason}")
         else:
             # Reject group-key columns supplied as target
             if self._looks_like_group_key(target_col):
@@ -87,7 +104,16 @@ class SpecEnricher:
                 )
 
         # ── 2. Detect aggregation need ────────────────────────────────
-        if not agg_needed:
+        # A key with one distinct value per row (e.g. claim_id) groups nothing.
+        if (agg_needed and df is not None and agg_key in df.columns
+                and df[agg_key].nunique(dropna=False) == len(df)):
+            notes.append(f"Aggregation dropped: '{agg_key}' is unique per row, "
+                         "so grouping by it would not change the data")
+            agg_needed, agg_key = False, ""
+        elif not agg_needed and raw_spec.source != "brief_model":
+            # The brief reading already decided whether results are per
+            # entity; the column-name heuristic below only fills the gap for
+            # the older extraction path.
             detected_key, ratio = self._detect_aggregation_need(df, column_names)
             if detected_key and ratio > 1.5:
                 agg_needed = True
@@ -172,14 +198,18 @@ class SpecEnricher:
                 metric = metric or "roc_auc"
 
         # ── 5. Final defaults ─────────────────────────────────────────
-        if not metric:
+        if not metric and task_type not in _UNSUPERVISED_TYPES:
             metric = "rmse" if task_type == "regression" else "roc_auc"
         if not task_desc or self._is_generic_description(task_desc):
-            task_desc = (
-                f"Predict {target_col} using "
-                f"{task_type.replace('_', ' ')}"
-                + (f" per {agg_key}" if agg_needed else "")
-            )
+            if target_col:
+                task_desc = (
+                    f"Predict {target_col} using "
+                    f"{task_type.replace('_', ' ')}"
+                    + (f" per {agg_key}" if agg_needed else "")
+                )
+            else:
+                task_desc = ("Explore and analyse the data; no labelled target "
+                             "column was identified")
             notes.append(f"Task description auto-generated: {task_desc}")
 
         return EnrichedSpec(
@@ -203,12 +233,21 @@ class SpecEnricher:
         columns: list[str],
         exclude: list[str] | None = None,
     ) -> tuple[str, str]:
-        """Score every column → return (best_column_name, reason_string)."""
+        """Score every column → return (best_column_name, reason_string).
+
+        A column is returned only with positive evidence that it is a label
+        (an outcome-like name, binary values, a coded outcome). With none, the
+        result is ("", reason): the data is treated as unlabelled. Taking the
+        top scorer regardless used to pick whichever column first tied at zero,
+        which is how a service_date column became a "target".
+        """
         exclude = exclude or []
-        best_col, best_score, best_reason = "", -999, "no match"
+        best_col, best_score, best_reason = "", 0, "no column shows evidence of being a label"
 
         for col in columns:
             if col in exclude:
+                continue
+            if df is not None and col in df.columns and self._unsuitable(df, col)[0]:
                 continue
             score = 0
             reasons: list[str] = []
@@ -428,6 +467,17 @@ class SpecEnricher:
         col_lower = col_name.lower()
         return any(p in col_lower for p in self.GROUP_KEY_PATTERNS)
 
+    @staticmethod
+    def _unsuitable(df: pd.DataFrame, col: str) -> tuple[bool, str]:
+        """The same target-suitability rule the infer_target tool enforces.
+
+        Shared rather than re-implemented so the brief extractor and the tool
+        cannot disagree about whether a date or identifier can be a label.
+        Imported lazily: agent_tools imports this module inside its tools.
+        """
+        from agent.api.agent_tools import _is_unsuitable_target
+        return _is_unsuitable_target(df, col)
+
     def _is_generic_description(self, desc: str) -> bool:
         GENERIC = [
             "unknown task", "not specified", "cannot determine",
@@ -448,7 +498,7 @@ class TaskSpecValidator:
     VALID_TASK_TYPES = {
         "binary_classification", "multiclass_classification",
         "regression", "timeseries_forecasting", "anomaly_detection",
-        "clustering", "survival_analysis",
+        "clustering", "survival_analysis", "exploratory_analysis",
     }
     VALID_METRICS = {
         "pr_auc", "roc_auc", "accuracy", "f1", "f1_macro",
@@ -469,7 +519,9 @@ class TaskSpecValidator:
             )
 
         if not spec.target_column:
-            failures.append("target_column is empty — cannot build a supervised model.")
+            # Correct, not a failure, for a task that has no label.
+            if spec.task_type not in _UNSUPERVISED_TYPES:
+                failures.append("target_column is empty — cannot build a supervised model.")
         elif spec.target_column not in column_names:
             failures.append(
                 f"target_column='{spec.target_column}' not in dataset "
@@ -486,7 +538,8 @@ class TaskSpecValidator:
                 "verify this is the prediction target."
             )
 
-        if spec.evaluation_metric not in self.VALID_METRICS:
+        if spec.evaluation_metric not in self.VALID_METRICS and not (
+                spec.task_type in _UNSUPERVISED_TYPES and not spec.evaluation_metric):
             failures.append(
                 f"evaluation_metric='{spec.evaluation_metric}' unknown. "
                 "Defaulting to pr_auc/rmse."

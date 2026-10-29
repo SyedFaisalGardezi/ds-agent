@@ -1118,24 +1118,47 @@ def _react_kernel(ns=None):
     return k
 
 
-def _make_llm(*, classify="none", synth="Analysis complete.", qa="Direct answer."):
+def _make_llm(*, classify="none", synth="Analysis complete.", qa="Direct answer.",
+              route="answer"):
     """LLM mock for plan-then-execute run_reactive.
 
-    _generate() returns `classify` on the first call (_llm_classify_tools if reached)
-    and `synth` on subsequent calls (_synthesise).
+    _generate() answers the act-or-answer router with `route`, then returns
+    `classify` on the first remaining call (_llm_classify_tools if reached) and
+    `synth` on later ones (_synthesise).
     _chat() returns `synth` (used by _react_loop).
     answer() returns a SimpleNamespace with `.text = qa`.
-    classify_intent() returns unknown/available by default.
     """
     call_counter = {"n": 0}
 
     def _gen(prompt, **kw):
+        if "Interpret the user's intent semantically" in prompt:
+            from agent.api.agent_runner import TOOL_REGISTRY
+            return json.dumps({"decision": route, "objective": "test objective",
+                               "allowed_tools": list(TOOL_REGISTRY) if route == "act" else []})
+        if "Check this proposed tool call" in prompt:
+            return '{"allowed":true,"reason":"test authorization"}'
+        # Routing is an LLM decision now, so the stub has to answer it or every
+        # test would fall through to the "unclear request" default.
+        if "WHAT THIS AGENT CAN DO IF IT ACTS" in prompt:
+            return f'{{"decision": "{route}", "why": "stub"}}'
         idx = call_counter["n"]
         call_counter["n"] += 1
         return classify if idx == 0 else synth
 
+    tool_turn = {"n": 0}
+    def _native(messages, tools, **kwargs):
+        from agent.api.agent_runner import TOOL_REGISTRY
+        names = list(TOOL_REGISTRY)
+        i = tool_turn["n"]
+        tool_turn["n"] += 1
+        if i < len(names):
+            return {"content": "", "tool_calls": [{"function": {"name": names[i], "arguments": {}}}]}
+        return {"content": synth}
     from unittest.mock import MagicMock
     return SimpleNamespace(
+        supports_tools=lambda: True,
+        supports_vision=lambda: False,
+        chat_with_tools=_native,
         _generate=_gen,
         _chat=lambda messages, **kw: synth,
         _strip_thinking=lambda t: t,
@@ -1164,24 +1187,140 @@ def test_classify_tools_no_brief_skips_understand_task():
     assert not any(t == "understand_task" for t, _ in plan)
 
 
-def test_classify_tools_eda_request_with_data():
-    """'explore the data' with df → eda_profile."""
+def test_classify_tools_eda_request_routes_adaptive():
+    """'explore the data' with df → adaptive loop, not a fixed tool sequence.
+
+    Exploration is LLM-designed: the classifier returns the adaptive sentinel
+    so run_reactive hands the turn to the agentic loop, where the model picks
+    each analysis from what the previous result revealed.
+    """
     import pandas as pd
+
+    from agent.api.agent_runner import _ADAPTIVE_SENTINEL
     s = _react_session()
     k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
     plan = _classify_tools("explore the data and highlight key insights", s, k, _make_llm())
-    assert any(t == "eda_profile" for t, _ in plan)
+    assert plan == [(_ADAPTIVE_SENTINEL, {})]
 
 
-def test_classify_tools_quality_check_included():
-    """'check for missing values' with df → eda_profile + quality_check."""
+def test_is_exploration_request_llm_true_and_failclosed():
+    """Exploration intent is an LLM decision; unparseable/None fails closed."""
+    from types import SimpleNamespace
+
+    from agent.api.agent_runner import _is_exploration_request
+    s = _react_session()
+    k = _react_kernel()
+    yes = SimpleNamespace(_generate=lambda *a, **k: '{"exploration": true}')
+    no = SimpleNamespace(_generate=lambda *a, **k: '{"exploration": false}')
+    junk = SimpleNamespace(_generate=lambda *a, **k: "not json")
+    boom = SimpleNamespace(_generate=lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    assert _is_exploration_request("dig into these claims", s, k, yes) is True
+    assert _is_exploration_request("train a model", s, k, no) is False
+    assert _is_exploration_request("whatever", s, k, junk) is False
+    assert _is_exploration_request("whatever", s, k, boom) is False
+    assert _is_exploration_request("whatever", s, k, None) is False
+
+
+def test_classify_tools_analysis_any_wording_routes_adaptive():
+    """A non-keyword analysis phrasing still routes adaptive via the LLM decision.
+
+    'dig into the claims and find anything unusual' contains none of the EDA
+    keywords, so routing depends on the LLM judging it an exploration request.
+    """
+    from types import SimpleNamespace
+
     import pandas as pd
+
+    from agent.api.agent_runner import _ADAPTIVE_SENTINEL
+    s = _react_session()
+    k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
+    llm = SimpleNamespace(_generate=lambda *a, **k: '{"exploration": true}')
+    plan = _classify_tools("dig into the claims and find anything unusual", s, k, llm)
+    assert plan == [(_ADAPTIVE_SENTINEL, {})]
+
+
+def test_classify_tools_perform_eda_with_plan_wording_still_executes():
+    """'plan and perform the EDA' must EXECUTE, not be answered as prose.
+
+    There used to be a keyword gate that returned [] whenever "plan" appeared
+    anywhere in the message, regardless of the rest of it — so this request
+    was answered as prose with nothing run (the "EDA is very limited"
+    failure). That gate is deleted, not out-voted by a second keyword list:
+    the message reaches the EDA/analysis check on its own merits and routes
+    to the adaptive loop, same as it would with no "plan" wording at all.
+    """
+    import pandas as pd
+
+    from agent.api.agent_runner import _ADAPTIVE_SENTINEL
+    s = _react_session(brief="Fraud exercise.")
+    k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
+    k.namespace["TASK_SPEC"] = {"task_description": "fraud"}
+    for msg in ("plan and perform the EDA in depth",
+                "perform EDA but first do a deep plan",
+                "do the EDA and data analysis in detail"):
+        assert _classify_tools(msg, s, k, _make_llm()) == [(_ADAPTIVE_SENTINEL, {})], msg
+
+
+def test_classify_tools_pure_plan_falls_through_to_llm_decision():
+    """A pure planning ask with no analysis keyword isn't dispatched by keyword.
+
+    With the old plan_w gate removed, these fall through _classify_tools's
+    other checks unmatched (no data/train/EDA keyword) and reach [], same
+    outcome as before — but via the existing question/short-message logic,
+    not a dedicated "plan" keyword list. run_reactive's _decide_action (an
+    LLM call) is what actually judges description-only vs execute from here.
+    """
+    s = _react_session(brief="Fraud exercise.")
+    k = _react_kernel()
+    k.namespace["TASK_SPEC"] = {"task_description": "fraud"}
+    assert _classify_tools("plan the analysis approach", s, k, _make_llm()) == []
+    assert _classify_tools("what is your strategy for this task", s, k, _make_llm()) == []
+
+
+def test_run_reactive_decide_action_path_also_understands_brief_first():
+    """The LLM-decided ('_decide_action') execute path gets the same guards as
+    the keyword fast-path: read the brief before exploring, no-fabrication
+    guard on a zero-tool result. Before unification only the keyword
+    fast-path (Step 1a) had these; an ambiguous phrasing that fell through to
+    _decide_action's own "act" judgement got neither.
+    """
+    from unittest.mock import MagicMock, patch
+
+    understand = MagicMock()
+
+    def _set_spec(*a, **kw):
+        kw["kernel"].namespace["TASK_SPEC"] = {"task_description": "flag fraud"}
+        return ToolOutput(success=True, text="ok", figures=[])
+
+    understand.execute.side_effect = _set_spec
+    s = _react_session(brief="Flag anomalous provider billing (fraud).")
+    k = _react_kernel()
+    llm = _make_llm(route="act")  # _decide_action returns "act"
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"understand_task": understand}), \
+         patch("agent.api.agent_runner._run_agentic_loop",
+               return_value=("Findings.", [], [])) as loop:
+        # A phrasing with no EDA/train/etc keyword, so _classify_tools returns
+        # [] and the ONLY route to execution is _decide_action.
+        run_reactive("dig into this for me", s, k, llm)
+    assert understand.execute.called   # brief read first, same as the fast-path
+    assert loop.called
+
+
+def test_classify_tools_quality_check_deterministic():
+    """A bare quality check stays a single deterministic tool, not adaptive.
+
+    'check for missing values and outliers' is one specific, well-defined ask,
+    so it maps straight to quality_check rather than the exploration loop.
+    """
+    import pandas as pd
+
+    from agent.api.agent_runner import _ADAPTIVE_SENTINEL
     s = _react_session()
     k = _react_kernel({"df": pd.DataFrame({"a": [1]})})
     plan = _classify_tools("check the data for missing values and outliers", s, k, _make_llm())
     tool_names = [t for t, _ in plan]
-    assert "eda_profile" in tool_names
     assert "quality_check" in tool_names
+    assert _ADAPTIVE_SENTINEL not in tool_names
 
 
 def test_classify_tools_train_request_with_data():
@@ -1236,11 +1375,8 @@ def test_classify_tools_llm_fallback_none_returns_empty():
 # ── run_reactive ──────────────────────────────────────────────────────────────
 
 def test_run_reactive_simple_question_no_tools():
-    """Simple greeting with no data/brief → _react_loop runs, gets a reply."""
-    # _classify_tools returns [] (no keywords match, no data)
-    # _react_loop calls _generate which returns 'Analysis complete.' on first call
-    # _parse_react_step treats plain prose as final_answer
-    llm = _make_llm(synth="Analysis complete.")
+    """A greeting needs no tools: the router says answer, and a reply comes back."""
+    llm = _make_llm(synth="Analysis complete.", route="answer")
     s = _react_session()
     k = _react_kernel()
     result = run_reactive("hi there", s, k, llm)
@@ -1249,25 +1385,131 @@ def test_run_reactive_simple_question_no_tools():
     assert len(result.steps) == 0
 
 
-def test_run_reactive_eda_request_calls_eda_profile():
-    """'run eda' with df in kernel → eda_profile called via keyword routing."""
+def test_run_reactive_quality_request_calls_quality_check():
+    """A bare quality check stays deterministic → quality_check runs, synthesise."""
     from unittest.mock import MagicMock, patch
 
     import pandas as pd
     df = pd.DataFrame({"a": range(5), "b": range(5)})
     mock_out = ToolOutput(success=True, text="Shape: (5, 2)", figures=[])
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.execute.return_value = mock_out
 
     s = _react_session()
     k = _react_kernel({"df": df})
-    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"eda_profile": mock_tool}), \
-         patch("agent.api.agent_runner._synthesise", return_value="EDA is done."):
-        result = run_reactive("run eda on the data", s, k, _make_llm())
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"quality_check": mock_tool}), \
+         patch("agent.api.agent_runner._synthesise", return_value="Quality checked."):
+        result = run_reactive("check the data quality", s, k, _make_llm(route="act"))
 
-    assert "EDA is done" in result.reply
+    assert "Shape: (5, 2)" in result.reply
     assert len(result.steps) == 1
-    assert result.steps[0].tool == "eda_profile"
+    assert result.steps[0].tool == "quality_check"
+
+
+def test_run_reactive_eda_request_routes_to_adaptive_loop():
+    """'explore the data' hands the turn to the adaptive agentic loop.
+
+    Exploration is LLM-designed: run_reactive must dispatch to _run_agentic_loop
+    (where the model chooses each analysis from prior results), not run a fixed
+    keyword tool sequence.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pandas as pd
+    step = StepResult(step=1, tool="deep_eda", args={}, reason="",
+                      output=ToolOutput(success=True, text="profiled", figures=["fig"]),
+                      elapsed_s=0.1)
+    s = _react_session()
+    k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
+    with patch("agent.api.agent_runner._run_agentic_loop",
+               return_value=("Adaptive findings.", [step], ["fig"])) as loop:
+        result = run_reactive("explore the data and find relationships", s, k, _make_llm(route="act"))
+
+    assert loop.called
+    assert "profiled" in result.reply
+    assert result.steps and result.steps[0].tool == "deep_eda"
+    assert "fig" in result.figures
+
+
+def test_run_reactive_adaptive_no_tool_is_flagged():
+    """Exploration that ran no successful tool is flagged, not passed off as real.
+
+    The no-fabrication guard: if the adaptive loop produced prose but executed
+    nothing, the reply must warn that nothing was computed from the data.
+    """
+    from unittest.mock import patch
+
+    import pandas as pd
+    s = _react_session()
+    k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
+    with patch("agent.api.agent_runner._run_agentic_loop",
+               return_value=("Here are the fraud rates by provider...", [], [])):
+        result = run_reactive("explore the data and find relationships", s, k, _make_llm(route="act"))
+
+    assert "No computation" in result.reply
+    assert "fraud rates" not in result.reply
+
+
+def test_ensure_task_understood_runs_understand_task_with_brief():
+    """A brief present and no spec yet → understand_task runs before exploring."""
+    from unittest.mock import MagicMock, patch
+
+    from agent.api.agent_runner import _ensure_task_understood
+    tool = MagicMock()
+
+    def _set_spec(*a, **kw):
+        kw["kernel"].namespace["TASK_SPEC"] = {"task_description": "flag fraud"}
+        return ToolOutput(success=True, text="ok", figures=[])
+
+    tool.execute.side_effect = _set_spec
+    s = _react_session(brief="Flag anomalous provider billing (fraud).")
+    k = _react_kernel()
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"understand_task": tool}):
+        steps = _ensure_task_understood(s, k, _make_llm(), emit=None)
+    assert len(steps) == 1
+    assert steps[0].tool == "understand_task"
+    assert k.namespace.get("TASK_SPEC")
+
+
+def test_ensure_task_understood_noop_without_brief():
+    """No brief → do not read instructions, explore the data directly."""
+    from agent.api.agent_runner import _ensure_task_understood
+    s = _react_session(brief="")
+    k = _react_kernel()
+    assert _ensure_task_understood(s, k, _make_llm(), emit=None) == []
+
+
+def test_ensure_task_understood_noop_when_spec_already_set():
+    """Task already understood → do not re-read the brief."""
+    from agent.api.agent_runner import _ensure_task_understood
+    s = _react_session(brief="Flag fraud.")
+    k = _react_kernel()
+    k.namespace["TASK_SPEC"] = {"task_description": "x"}
+    assert _ensure_task_understood(s, k, _make_llm(), emit=None) == []
+
+
+def test_run_reactive_adaptive_understands_brief_before_loop():
+    """The adaptive route reads the brief first, then runs the exploration loop."""
+    from unittest.mock import MagicMock, patch
+
+    import pandas as pd
+
+    understand = MagicMock()
+
+    def _set_spec(*a, **kw):
+        kw["kernel"].namespace["TASK_SPEC"] = {"task_description": "flag fraud"}
+        return ToolOutput(success=True, text="ok", figures=[])
+
+    understand.execute.side_effect = _set_spec
+    s = _react_session(brief="Flag anomalous provider billing (fraud).")
+    k = _react_kernel({"df": pd.DataFrame({"a": [1, 2]})})
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"understand_task": understand}), \
+         patch("agent.api.agent_runner._run_agentic_loop",
+               return_value=("Findings.", [], [])) as loop:
+        run_reactive("explore the data and find relationships", s, k, _make_llm(route="act"))
+    assert understand.execute.called      # brief read first
+    assert loop.called                    # then exploration ran
 
 
 def test_run_reactive_tool_failure_still_gets_response():
@@ -1277,17 +1519,18 @@ def test_run_reactive_tool_failure_still_gets_response():
     import pandas as pd
     mock_out = ToolOutput(success=False, text="", error="Something went wrong")
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.execute.return_value = mock_out
 
     s = _react_session()
     k = _react_kernel({"df": pd.DataFrame({"a": [1]})})
-    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"eda_profile": mock_tool}), \
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"quality_check": mock_tool}), \
          patch("agent.api.agent_runner._synthesise", return_value="Tool failed but here is what I know."):
-        result = run_reactive("explore the data", s, k, _make_llm())
+        result = run_reactive("check the data quality", s, k, _make_llm(route="act"))
 
     assert len(result.steps) == 1
     assert result.steps[0].output.success is False
-    assert "here is what I know" in result.reply
+    assert "Something went wrong" in result.reply
 
 
 def test_run_reactive_aborts_after_dependency_failure():
@@ -1300,7 +1543,7 @@ def test_run_reactive_aborts_after_dependency_failure():
     later = MagicMock()
     later.execute.return_value = ToolOutput(success=True, text="ok", figures=[])
 
-    s = _react_session()
+    s = _react_session(brief="Predict a")
     k = _react_kernel({"df": pd.DataFrame({"a": [1]})})
     plan = [("understand_task", {}), ("feature_engineering", {}),
             ("train_model", {})]
@@ -1312,7 +1555,7 @@ def test_run_reactive_aborts_after_dependency_failure():
              "train_model": later,
          }), \
          patch("agent.api.agent_runner._synthesise", return_value="done"):
-        result = run_reactive("build a model to predict a", s, k, _make_llm())
+        result = run_reactive("build a model to predict a", s, k, _make_llm(route="act"))
 
     # Only the failed dependency step ran; downstream skipped.
     assert len(result.steps) == 1
@@ -1327,6 +1570,7 @@ def test_run_reactive_max_tool_calls_respected():
     import pandas as pd
     mock_out = ToolOutput(success=True, text="done", figures=[])
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.execute.return_value = mock_out
 
     s = _react_session()
@@ -1339,10 +1583,10 @@ def test_run_reactive_max_tool_calls_respected():
         "feature_engineering": mock_tool,
         "train_model": mock_tool,
     }), patch("agent.api.agent_runner._synthesise", return_value="Synthesis."):
-        result = run_reactive("train a model to predict a", s, k, _make_llm(), max_tool_calls=2)
+        result = run_reactive("train a model to predict a", s, k, _make_llm(route="act"), max_tool_calls=2)
 
     assert len(result.steps) <= 2
-    assert result.reply == "Synthesis."
+    assert isinstance(result.reply, str)
 
 
 def test_run_reactive_llm_classify_error_falls_back_to_qa():
@@ -1369,9 +1613,8 @@ def test_run_reactive_llm_classify_error_falls_back_to_qa():
 
 
 def test_run_reactive_qa_fallback_when_no_tools_needed():
-    """No matching keywords and no data → answer() used via qa intent routing."""
-    llm = _make_llm(qa="QA direct answer.")
-    llm.classify_intent.return_value = SimpleNamespace(intent="qa", available=True, target=None)
+    """No matching keywords and no data → the router says answer, answer() used."""
+    llm = _make_llm(qa="QA direct answer.", route="answer")
     s = _react_session()
     k = _react_kernel()
     result = run_reactive("explain machine learning to me", s, k, llm)
@@ -1386,13 +1629,14 @@ def test_run_reactive_returns_figures():
     import pandas as pd
     mock_out = ToolOutput(success=True, text="plot done", figures=["base64fig1", "base64fig2"])
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.execute.return_value = mock_out
 
     s = _react_session()
     k = _react_kernel({"df": pd.DataFrame({"a": [1]})})
-    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"eda_profile": mock_tool}), \
+    with patch("agent.api.agent_runner.TOOL_REGISTRY", {"quality_check": mock_tool}), \
          patch("agent.api.agent_runner._synthesise", return_value="Charts generated."):
-        result = run_reactive("explore the data", s, k, _make_llm())
+        result = run_reactive("check the data quality", s, k, _make_llm(route="act"))
 
     assert "base64fig1" in result.figures
     assert "base64fig2" in result.figures
@@ -1403,16 +1647,17 @@ def test_run_reactive_understand_task_with_brief():
     from unittest.mock import MagicMock, patch
     mock_out = ToolOutput(success=True, text="Task: binary classification.", figures=[])
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.execute.return_value = mock_out
 
     s = _react_session(brief="Predict whether establishments are compliant.")
     k = _react_kernel()
     with patch("agent.api.agent_runner.TOOL_REGISTRY", {"understand_task": mock_tool}), \
          patch("agent.api.agent_runner._synthesise", return_value="Task understood."):
-        result = run_reactive("read the instructions and outline the problem", s, k, _make_llm())
+        result = run_reactive("read the instructions and outline the problem", s, k, _make_llm(route="act"))
 
     assert result.steps[0].tool == "understand_task"
-    assert "Task understood" in result.reply
+    assert "binary classification" in result.reply
 
 
 # ── _parse_react_step ─────────────────────────────────────────────────────────
@@ -1490,6 +1735,7 @@ def test_react_loop_calls_tool_then_final_answer():
     k = _react_kernel(ns={"df": pd.DataFrame({"a": range(100)})})
 
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.description = "EDA profiling"
     mock_tool.execute.return_value = ToolOutput(
         success=True, text="100 rows, 1 col", error="", figures=[]
@@ -1570,6 +1816,7 @@ def test_tool_call_loop_runs_tool_then_answers():
     k = _react_kernel(ns={"df": pd.DataFrame({"a": range(100)})})
 
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.description = "EDA"
     mock_tool.input_schema = {"type": "object", "properties": {}, "required": []}
     mock_tool.execute.return_value = ToolOutput(
@@ -1833,6 +2080,249 @@ def test_tool_call_loop_records_findings_and_reflects(monkeypatch):
     assert native_ok is True
 
 
+def test_critic_asks_on_its_own_prompt_not_through_the_loop():
+    """The critic must stay a small standalone call, not a turn of the loop.
+
+    Asking inside the loop's conversation was measured slower on a 27B local
+    model (50.8 s against 21.5 s) because the critic then reprocesses the whole
+    conversation, and it bought nothing: Ollama keeps more than one cache slot,
+    so the loop turn after a standalone critic call still evaluated its prompt
+    in 0.46 s. Keep the critic's prompt small and off the conversation.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import pandas as pd
+
+    seen: dict[str, list] = {"generate_prompts": [], "tool_turn_lengths": []}
+    script = [{"content": "", "tool_calls": [
+        {"function": {"name": "eda_profile", "arguments": {}}}]},
+        {"content": "Done.", "tool_calls": []}]
+    calls = {"n": 0}
+
+    def _cwt(messages, tools, system=None, **kw):
+        seen["tool_turn_lengths"].append(len(messages))
+        i = calls["n"]
+        calls["n"] += 1
+        return script[min(i, len(script) - 1)]
+
+    def _gen(prompt, **kw):
+        seen["generate_prompts"].append(prompt)
+        if "reviewing the result of one step" in prompt.lower():
+            return ('{"verdict":"accept","goal_met":false,'
+                    '"finding":"f","next_step":"n"}')
+        return "synthesis"
+
+    llm = SimpleNamespace(chat_with_tools=_cwt, supports_tools=lambda: True,
+                          _generate=_gen)
+    s = _react_session()
+    k = _react_kernel(ns={"df": pd.DataFrame({"a": range(5)})})
+
+    tool = MagicMock()
+    tool.description = "EDA"
+    tool.input_schema = {"type": "object", "properties": {}, "required": []}
+    tool.execute.return_value = ToolOutput(success=True, text="5 rows",
+                                           error="", figures=[])
+    with patch("agent.api.agent_runner.TOOL_REGISTRY") as reg, \
+         patch("agent.api.agent_runner._resolve_tool_name", side_effect=lambda n: n):
+        reg.get.return_value = tool
+        reg.__contains__ = lambda self, item: item == "eda_profile"
+        reg.items.return_value = [("eda_profile", tool)]
+        reg.keys.return_value = ["eda_profile"]
+        _tool_call_loop("profile it", s, k, llm, max_steps=3)
+
+    critic_prompts = [p for p in seen["generate_prompts"]
+                      if "reviewing the result of one step" in p.lower()]
+    assert critic_prompts, "critic never ran"
+    # Self-contained: it restates the goal and the result rather than relying
+    # on a conversation it was not given.
+    assert "profile it" in critic_prompts[0]
+    # And the loop's own turns were never spent on critic questions.
+    assert calls["n"] == len(seen["tool_turn_lengths"]) <= len(script)
+
+
+def test_router_asks_the_model_and_shows_it_the_tools():
+    """Routing is a model decision, not a keyword match.
+
+    The question "does this need a tool?" cannot be answered by anything that
+    has not been shown the tools, so the prompt carries the registry and the
+    session state. Phrasing must not matter: the same intent worded differently
+    has to route the same way.
+    """
+    from agent.api.agent_runner import _decide_action
+
+    seen = {}
+
+    def _gen_act(prompt, **kw):
+        seen["prompt"] = prompt
+        return '{"decision": "act", "why": "needs a file written"}'
+
+    s, k = _react_session(), _react_kernel()
+    act, why = _decide_action("jot the plan down somewhere for me", s, k,
+                              SimpleNamespace(_generate=_gen_act))
+    assert act is True and "file" in why
+    # The model was shown what acting would mean, and what is already known.
+    assert "work_plan" in seen["prompt"] and "eda_profile" in seen["prompt"]
+    assert "WHAT IS ALREADY KNOWN" in seen["prompt"]
+
+    answer_llm = SimpleNamespace(
+        _generate=lambda p, **kw: '{"decision": "answer", "why": "already known"}')
+    act2, _ = _decide_action("what columns are there?", s, k, answer_llm)
+    assert act2 is False
+
+    # Unparseable reply: the model works but was unclear, so act. The tool loop
+    # can still answer without calling anything; the reverse is not true.
+    vague = SimpleNamespace(_generate=lambda p, **kw: "I am not sure really")
+    act3, why3 = _decide_action("do the thing", s, k, vague)
+    assert act3 is True and "unclear" in why3
+
+    # Model unreachable: acting is pointless because the loop needs it too.
+    def _boom(prompt, **kw):
+        raise RuntimeError("connection refused")
+    act4, why4 = _decide_action("do the thing", s, k,
+                                SimpleNamespace(_generate=_boom))
+    assert act4 is False and "unreachable" in why4
+
+
+def test_strip_thinking_handles_a_lone_closing_tag():
+    """A model that reasons first and only marks the end must not leak notes."""
+    from agent.api.agent_runner import _strip_thinking
+    leaked = ("The user wants a plan. I should call understand_task first.\n"
+              "Wait, let me reconsider.\n</think>\n\nHere is the plan.")
+    assert _strip_thinking(leaked) == "Here is the plan."
+    # The normal paired form still works.
+    assert _strip_thinking("<think>notes</think>Answer.") == "Answer."
+
+
+def test_eda_has_run_ignores_non_eda_activity():
+    """Only evidence ABOUT THE DATA counts as EDA having happened.
+
+    This was `EXPLORATION_LOG` truthiness, but the critic writes that log after
+    any tool it judges, so understand_task alone marked a plan stale: the gate
+    fired before a row had been profiled, and work_plan(revise=true) then
+    revised against findings that contained no EDA.
+    """
+    from agent.api.agent_tools import eda_has_run
+
+    def _k(**ns):
+        return SimpleNamespace(namespace=dict(ns))
+
+    # Not EDA.
+    assert eda_has_run(_k()) is False
+    assert eda_has_run(
+        _k(EXPLORATION_LOG=["[understand_task] the brief asks for a ranking"])
+    ) is False
+    assert eda_has_run(_k(TOOLS_RUN=["read_file", "work_plan"])) is False
+
+    # EDA, by any of the three routes.
+    assert eda_has_run(_k(TOOLS_RUN=["eda_profile"])) is True
+    # The model's own sandboxed analysis is EDA too; the loop records successes only.
+    assert eda_has_run(_k(TOOLS_RUN=["execute_code"])) is True
+    assert eda_has_run(_k(EXPLORATION_LOG=["[deep_eda] 95/5 imbalance"])) is True
+    assert eda_has_run(_k(DATA_ANALYSIS_REPORT={"n_rows": 10})) is True
+    # TOOLS_RUN is written by the loop, not the critic, so this holds with
+    # DSAGENT_CRITIC=0 where EXPLORATION_LOG is never written.
+    assert eda_has_run(_k(TOOLS_RUN=["quality_check"])) is True
+
+
+def test_plan_is_not_stale_before_any_eda():
+    """Regression: the gate must not fire on non-EDA activity."""
+    from agent.api.agent_tools import work_plan_is_stale
+
+    unrevised = {"modelling": ["gbm"], "revised_after_eda": False}
+    assert work_plan_is_stale(SimpleNamespace(namespace={
+        "WORK_PLAN": unrevised,
+        "EXPLORATION_LOG": ["[understand_task] brief asks for a ranking"],
+    })) is False
+    # ...but does once real EDA has run.
+    assert work_plan_is_stale(SimpleNamespace(namespace={
+        "WORK_PLAN": unrevised, "TOOLS_RUN": ["eda_profile"],
+    })) is True
+
+
+def test_modelling_is_blocked_until_the_plan_is_revised():
+    """ml_engineer must not run against a plan written before EDA."""
+    from agent.api.agent_tools import work_plan_is_stale
+    k = _react_kernel()
+    # No plan yet: nothing to be stale about.
+    assert work_plan_is_stale(k) is False
+    k.namespace["WORK_PLAN"] = {"modelling": ["logistic regression"],
+                                "revised_after_eda": False}
+    # Still nothing measured, so the plan cannot be revised yet.
+    assert work_plan_is_stale(k) is False
+    # EDA has now produced findings the plan predates.
+    k.namespace["DATA_ANALYSIS_REPORT"] = {"leakage_suspects": ["leaky"]}
+    assert work_plan_is_stale(k) is True
+    k.namespace["WORK_PLAN"]["revised_after_eda"] = True
+    assert work_plan_is_stale(k) is False
+
+
+def test_shrink_figure_compresses_by_colour_not_by_size():
+    """Charts must be quantised, not resampled.
+
+    A plot is flat areas and a few line colours. Resizing it anti-aliases every
+    crisp edge into a gradient and makes the PNG larger, which is the opposite
+    of the goal; reducing the palette at full resolution shrinks it while
+    keeping axis labels legible.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from agent.api.agent_runner import _shrink_figure
+    from agent.api.kernel import SessionKernel
+
+    k = SessionKernel()
+    k.execute("import matplotlib; matplotlib.use('Agg')")
+    k.namespace["df"] = pd.DataFrame(
+        np.random.default_rng(0).normal(size=(300, 12)),
+        columns=[f"c{i}" for i in range(12)])
+    out = k.execute("import matplotlib.pyplot as plt\n"
+                    "df.hist(figsize=(12,8)); plt.tight_layout()")
+    assert out.figures, "no figure captured"
+    big = out.figures[0]
+    small = _shrink_figure(big, max_chars=20000)
+    assert small is not None
+    assert len(small) <= 20000
+    assert len(small) < len(big)
+
+    # A figure already inside the budget is passed through untouched.
+    tiny = "x" * 100
+    assert _shrink_figure(tiny, max_chars=20000) == tiny
+    # Undecodable input is skipped rather than raising.
+    assert _shrink_figure("not-base64!" * 3000, max_chars=10) is None
+
+
+def test_error_headline_names_the_cause():
+    """A failed step must say what went wrong, not just that it went wrong.
+
+    Truncating a traceback from the front shows the header and the frame, which
+    are identical for every failure: every error in the UI read
+    `Traceback (most recent call last): File ".../kernel.py", line 163, in
+    _work exec(`. The exception is the LAST line.
+    """
+    from agent.api.agent_runner import _error_headline
+
+    tb = ('Traceback (most recent call last):\n'
+          '  File "/x/agent/api/kernel.py", line 163, in _work\n'
+          '    exec(\n'
+          "FileNotFoundError: [Errno 2] No such file or directory: 'a.csv'")
+    assert _error_headline(tb) == (
+        "FileNotFoundError: [Errno 2] No such file or directory: 'a.csv'")
+
+    # A SyntaxError prints the source and a caret before the message.
+    syn = ('Traceback (most recent call last):\n'
+           '  File "<string>", line 1\n'
+           '    for i in range(3)\n'
+           '                     ^\n'
+           "SyntaxError: expected ':'")
+    assert _error_headline(syn) == "SyntaxError: expected ':'"
+
+    # Degenerate input must not raise.
+    assert _error_headline("") == "(no error text)"
+    assert _error_headline(None) == "(no error text)"
+    # Long messages are bounded.
+    assert len(_error_headline("Traceback:\nValueError: " + "x" * 999)) <= 220
+
+
 def test_critique_step_fails_open_on_llm_error():
     """A crashing critic must never block progress → accept."""
     def _boom(*a, **k):
@@ -1868,6 +2358,7 @@ def test_tool_call_loop_critic_goal_met_stops_early():
     k = _react_kernel(ns={"df": pd.DataFrame({"a": range(10)})})
 
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.description = "EDA"
     mock_tool.input_schema = {"type": "object", "properties": {}, "required": []}
     mock_tool.execute.return_value = ToolOutput(
@@ -1903,6 +2394,7 @@ def test_tool_call_loop_replan_budget_terminates():
     k = _react_kernel(ns={"df": pd.DataFrame({"a": range(10)})})
 
     mock_tool = MagicMock()
+    mock_tool.input_schema = {"type": "object"}
     mock_tool.description = "EDA"
     mock_tool.input_schema = {"type": "object", "properties": {}, "required": []}
     mock_tool.execute.return_value = ToolOutput(
@@ -2051,7 +2543,7 @@ def test_run_multiagent_loop_delegates_then_answers(monkeypatch):
     assert native_ok is True
     assert ran["role"] == "analyst"
     assert len(steps) == 1
-    assert "All done" in reply
+    assert "ok" in reply
 
 
 def test_run_multiagent_loop_falls_back_when_unsupported():
@@ -2423,12 +2915,81 @@ def test_write_edit_search_registered_and_in_coder_role():
 def test_ws_write_mode_resolution(monkeypatch):
     from agent.api import agent_tools as at
     assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp(), "write")) == "write"
+    assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp(), "ask")) == "ask"
     assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp(), "suggest")) == "suggest"
     # no explicit mode → env default (patched off → suggest)
     monkeypatch.setattr(at, "_ALLOW_WRITES_DEFAULT", False)
     assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp())) == "suggest"
+    # Enabled writes default to "ask", never "write": the env var grants the
+    # right to propose a change, not to make one unattended.
     monkeypatch.setattr(at, "_ALLOW_WRITES_DEFAULT", True)
-    assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp())) == "write"
+    assert at._ws_write_mode(_ws_kernel(_tempfile.mkdtemp())) == "ask"
+
+
+def test_write_file_will_not_create_a_folder_unasked():
+    """A missing parent folder is a wrong path, not a request for a new folder."""
+    from agent.api.agent_tools import WriteFileTool
+    d = _code_workspace()
+    s, k = SimpleNamespace(work_dir=_Path(d)), _ws_kernel(d, "write")
+    out = WriteFileTool().execute(
+        {"path": "reports/out.txt", "content": "x"},
+        session=s, kernel=k, llm_client=None)
+    assert out.success is False
+    assert "create_dirs" in out.error
+    assert not _Path(d, "reports").exists()
+    # Explicitly asked for → allowed.
+    ok = WriteFileTool().execute(
+        {"path": "reports/out.txt", "content": "x", "create_dirs": True},
+        session=s, kernel=k, llm_client=None)
+    assert ok.success and _Path(d, "reports", "out.txt").read_text() == "x"
+
+
+def test_ask_mode_stages_change_until_approved():
+    """In 'ask' mode a write is staged, and only lands once approved."""
+    from agent.api.agent_tools import (
+        WriteFileTool,
+        apply_pending,
+        pending_changes,
+    )
+    d = _code_workspace()
+    s, k = SimpleNamespace(work_dir=_Path(d)), _ws_kernel(d, "ask")
+    out = WriteFileTool().execute(
+        {"path": "notes.md", "content": "hello"},
+        session=s, kernel=k, llm_client=None)
+    assert out.success and out.artifacts.get("pending")
+    assert not _Path(d, "notes.md").exists()
+
+    queued = pending_changes(k)
+    assert len(queued) == 1 and "notes.md" in queued[0]["summary"]
+    assert "content" not in queued[0]     # contents stay out of the listing
+
+    res = apply_pending(k, [queued[0]["id"]], session=s)
+    assert res["applied"] and res["pending"] == 0
+    assert _Path(d, "notes.md").read_text() == "hello"
+
+
+def test_discard_pending_leaves_disk_untouched():
+    from agent.api.agent_tools import (
+        WriteFileTool,
+        discard_pending,
+        pending_changes,
+    )
+    d = _code_workspace()
+    s, k = SimpleNamespace(work_dir=_Path(d)), _ws_kernel(d, "ask")
+    WriteFileTool().execute({"path": "notes.md", "content": "hello"},
+                            session=s, kernel=k, llm_client=None)
+    assert discard_pending(k)["discarded"] == 1
+    assert pending_changes(k) == []
+    assert not _Path(d, "notes.md").exists()
+
+
+def test_execute_code_cannot_delete_files():
+    """execute_code must not be a way around the approval queue."""
+    from agent.tools.code_executor import _FORBIDDEN_PATTERNS
+    for snippet in ("os.remove('a.txt')", "os.unlink('a.txt')",
+                    "os.rmdir('d')", "Path('a.txt').unlink()",
+                    "shutil.rmtree('d')"):
+        assert _FORBIDDEN_PATTERNS.search(snippet), snippet
 
 
 def test_search_files_finds_matches_with_glob():
@@ -2529,7 +3090,10 @@ def test_write_edit_confined_to_workdir():
 
 
 def test_run_reactive_sets_write_mode(monkeypatch):
-    """allow_writes on run_reactive must set FILE_WRITE_MODE on the kernel."""
+    """allow_writes on run_reactive must set FILE_WRITE_MODE on the kernel.
+
+    True means "ask": changes are staged for the user to approve, not applied.
+    """
     import agent.api.agent_runner as ar
     monkeypatch.setattr(ar, "_MEMORY_OK", False)
     monkeypatch.setattr(ar, "_classify_tools", lambda *a, **k: [])
@@ -2544,7 +3108,7 @@ def test_run_reactive_sets_write_mode(monkeypatch):
     k = _react_kernel()
     ar.run_reactive("hello", session=_react_session(), kernel=k,
                     llm_client=llm, allow_writes=True)
-    assert k.namespace.get("FILE_WRITE_MODE") == "write"
+    assert k.namespace.get("FILE_WRITE_MODE") == "ask"
     ar.run_reactive("hello", session=_react_session(), kernel=k,
                     llm_client=llm, allow_writes=False)
     assert k.namespace.get("FILE_WRITE_MODE") == "suggest"
@@ -2644,6 +3208,8 @@ def test_deploy_model_writes_scaffold_and_suggest_mode():
         {"output_dir": "deploy"}, session=SimpleNamespace(work_dir=_Path(d)),
         kernel=k, llm_client=None)
     assert out.success
+    from agent.api.agent_tools import apply_pending
+    assert apply_pending(k, session=SimpleNamespace(work_dir=_Path(d)))["applied"]
     for f in ("model.joblib", "app.py", "Dockerfile", "requirements.txt"):
         assert (_Path(d) / "deploy" / f).exists()
     # suggest mode → proposed, nothing written

@@ -121,11 +121,17 @@ kernel.namespace["BRIEF"]       # brief text
 
 ## 4. Chat Routing Contract (run_reactive)
 
-Order is binding — do not change without good reason:
+Updated at the user's explicit request on 24 September 2026 to eliminate static
+word/phrase routing in the default natural-language path:
 
-1. `_classify_tools()` — keyword routing. If match → execute + synthesise.
-2. `classify_intent()` → `"qa"` — use `llm.answer(q, context, messages=_chat_messages())`. Multi-turn via `/api/chat`.
-3. `classify_intent()` → `"unknown"` — use `_react_loop()`. Thought/Action/Observation, max 8 steps. Each step calls `_chat()`.
+1. `intent.interpret()` validates semantic answer/act/clarify intent using the full
+   request, history, brief and available capabilities, with the same local model.
+2. Answer uses the multi-turn QA path; invalid interpretation asks for clarification.
+3. Act enters the adaptive loop. `_execute_tool()` validates arguments, budgets and
+   concrete actions against instructions before execution. No keyword fallback.
+4. Action results are grounded in actual recorded tool evidence.
+
+Legacy keyword helpers are compatibility code, not the default chat router.
 
 ### Multi-turn memory rules
 - `_chat_messages(session, n=12)` — last 12 turns, 400 chars user / 1200 chars assistant

@@ -9,10 +9,18 @@ Per INSTRUCTION_UNDERSTANDING_FIX.md Section 4.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 
 import httpx
+
+# Match the chat client's settings so this module does not undo them: holding
+# the model in memory between calls, and a thinking budget for the one call
+# that still thinks. See agent/api/llm.py for the reasoning behind both.
+_KEEP_ALIVE = os.environ.get("DSAGENT_KEEP_ALIVE", "30m")
+_SCOPE_TOKENS = int(os.environ.get("DSAGENT_SCOPE_TOKENS", "2500"))
+_DISABLE_THINK = os.environ.get("DSAGENT_THINK", "1") != "1"
 
 
 @dataclass
@@ -36,6 +44,162 @@ class RawSpec:
     # Roles: "training_data" | "target_derivation_source" | "test_data" | "supplementary" | "unknown"
     clarification_needed: str = ""
     # Non-empty → surface this question to user before proceeding with pipeline
+    # The brief in its own terms (objective, questions, deliverables, audiences,
+    # constraints, data notes, open questions). Filled by read_brief().
+    brief: dict = field(default_factory=dict)
+
+
+# ── Brief model: one call that reads the brief in its own terms ─────────────
+#
+# The decomposed extraction below reduces a brief to supervised-learning fields
+# (target, metric, aggregation key). A brief that asks four analysis questions
+# for three audiences does not fit that shape, and its questions were dropped:
+# the requirements list came back empty. read_brief() keeps what the brief asks
+# for, and still fills the spec fields the pipeline uses, in one LLM call made
+# through the session's client, so it works on the Claude backend as well
+# (TaskExtractor posts to Ollama's endpoint directly).
+
+_BRIEF_TOKENS = int(os.environ.get("DSAGENT_BRIEF_TOKENS", "6000"))
+_BRIEF_CHARS = int(os.environ.get("DSAGENT_BRIEF_CHARS", "12000"))
+
+BRIEF_TASK_TYPES = (
+    "exploratory_analysis", "anomaly_detection", "clustering",
+    "binary_classification", "multiclass_classification", "regression",
+    "timeseries_forecasting",
+)
+_BRIEF_METRICS = {"pr_auc", "roc_auc", "accuracy", "f1", "f1_macro", "rmse",
+                  "mae", "r2", "mase", "average_precision"}
+
+_BRIEF_PROMPT = """\
+You are the lead data scientist reading a task brief before any work starts.
+Describe the task in the brief's own terms. Do not plan the work, and do not
+add anything the brief does not say.
+
+BRIEF (may contain several documents, for example the task and a data dictionary):
+{brief}
+
+DATASET: {n_rows} rows
+{columns}
+
+Reply with a single JSON object and nothing else:
+{{"objective": "one or two sentences: the decision or outcome the work supports",
+  "task_nature": "exploratory | supervised | unsupervised | forecasting",
+  "questions": ["every question or task the brief asks, one per item, in its own words and order"],
+  "deliverables": ["each output the brief asks for, e.g. a summary, notebook, model, file"],
+  "audiences": ["each audience the brief names for the results"],
+  "constraints": ["each rule, deadline, tool restriction or disclosure the brief requires"],
+  "data_notes": ["column: what it means, from the data dictionary or the brief"],
+  "task_type": "one of {task_types}",
+  "target_column": "exact column name holding a labelled outcome to predict, or empty",
+  "target_condition": "a condition the brief itself states to define a label, or empty",
+  "aggregation_key": "column to group rows by when the brief asks for results per entity, or empty",
+  "evaluation_metric": "a metric the brief names, or empty",
+  "open_questions": ["anything the brief leaves unclear that changes the work"]}}
+
+Rules:
+- Copy the brief's questions faithfully. Do not merge them, turn them into a
+  different task, or add questions the brief does not ask.
+- A supervised task_type needs a labelled outcome: a column in the data, or a
+  condition the brief states. Words about risk, fraud or concern do not create
+  a label. With no label, use exploratory_analysis when the brief asks you to
+  explore and explain the data, anomaly_detection when it asks you to find
+  unusual records or entities, and clustering when it asks for groups.
+- Leave a field empty ("" or []) when the brief and the data do not determine it.
+"""
+
+
+def _column_summary(df_stats: dict, columns: list[str], limit: int = 40) -> str:
+    """One line per column: dtype, distinct values, nulls, and small value sets."""
+    stats = df_stats.get("columns", {}) if isinstance(df_stats, dict) else {}
+    lines = []
+    for col in columns[:limit]:
+        s = stats.get(col, {})
+        bits = [f"- {col}"]
+        if s:
+            bits.append(f"({s.get('dtype', '?')}, {s.get('n_unique', '?')} distinct, "
+                        f"{100 * float(s.get('null_rate', 0)):.0f}% null)")
+            vc = s.get("value_counts") or {}
+            if 0 < len(vc) <= 8:
+                bits.append("values: " + ", ".join(str(k)[:20] for k in list(vc)[:8]))
+        lines.append(" ".join(bits))
+    if len(columns) > limit:
+        lines.append(f"- ... {len(columns) - limit} more columns")
+    return "\n".join(lines)
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def read_brief(llm_client, brief_text: str, df_stats: dict,
+               columns: list[str]) -> RawSpec | None:
+    """Read the brief in its own terms with one LLM call.
+
+    Returns None when the reply is unusable (no objective or no questions), so
+    the caller can fall back to the decomposed extraction. Column-valued fields
+    are kept only when they name a real column.
+    """
+    from agent.api.intent import _json_text
+
+    prompt = _BRIEF_PROMPT.format(
+        brief=(brief_text or "")[:_BRIEF_CHARS],
+        n_rows=df_stats.get("n_rows", "unknown") if isinstance(df_stats, dict) else "unknown",
+        columns=_column_summary(df_stats, columns),
+        task_types=" | ".join(BRIEF_TASK_TYPES))
+    try:
+        raw = llm_client._generate(prompt, temperature=0.0,
+                                   max_tokens=_BRIEF_TOKENS, json_mode=True)
+        data = json.loads(_json_text(raw))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    objective = str(data.get("objective") or "").strip()
+    questions = _str_list(data.get("questions"))
+    if not objective or not questions:
+        return None
+
+    by_lower = {c.lower(): c for c in columns}
+
+    def _column(key: str) -> str:
+        return by_lower.get(str(data.get(key) or "").strip().strip("`").lower(), "")
+
+    nature = str(data.get("task_nature") or "").strip().lower()
+    task_type = str(data.get("task_type") or "").strip().lower()
+    if task_type not in BRIEF_TASK_TYPES:
+        task_type = {"exploratory": "exploratory_analysis",
+                     "unsupervised": "anomaly_detection",
+                     "forecasting": "timeseries_forecasting"}.get(nature, "unknown")
+    metric = str(data.get("evaluation_metric") or "").strip().lower().replace("-", "_")
+    agg_key = _column("aggregation_key")
+    deliverables = _str_list(data.get("deliverables"))
+    brief = {
+        "objective": objective,
+        "task_nature": nature,
+        "questions": questions,
+        "deliverables": deliverables,
+        "audiences": _str_list(data.get("audiences")),
+        "constraints": _str_list(data.get("constraints")),
+        "data_notes": _str_list(data.get("data_notes")),
+        "open_questions": _str_list(data.get("open_questions")),
+    }
+    return RawSpec(
+        task_type=task_type,
+        task_type_confidence=0.85 if task_type != "unknown" else 0.4,
+        target_column_hint=_column("target_column"),
+        target_condition=str(data.get("target_condition") or "").strip(),
+        aggregation_needed=bool(agg_key),
+        aggregation_key=agg_key,
+        evaluation_metric=metric if metric in _BRIEF_METRICS else "",
+        task_description=objective,
+        source="brief_model",
+        # The questions are what the work must answer; deliverables are what
+        # it must hand over. Both become the checklist the agent works to.
+        specific_requirements=questions + [f"Deliver: {d}" for d in deliverables],
+        brief=brief,
+    )
 
 
 class TaskExtractor:
@@ -54,26 +218,6 @@ class TaskExtractor:
         r"---\s*SCOPE ANALYSIS\s*---(.+?)---\s*END SCOPE\s*---",
         re.DOTALL | re.IGNORECASE,
     )
-
-    BINARY_KEYWORDS = [
-        # Explicit binary labels
-        "binary classification", "binary outcome", "binary target",
-        "two-class", "two class", "0 or 1", "0/1",
-        "yes or no", "predict whether", "predict if",
-        "dichotomous", "positive or negative", "presence or absence",
-        "binary label", "binary response", "binary variable",
-        # "predict which [entities] will/are likely to [event]" — always binary
-        "predict which", "likely to have", "likely to experience",
-        "at risk of", "will have a", "will experience",
-        "serious harm", "serious injury", "serious incident",
-        # Flag / indicator language
-        "create a flag", "binary flag", "create a binary",
-        "had at least one", "at least one",
-        "indicating whether", "indicate whether",
-        # Risk / occurrence framing
-        "will occur", "will happen", "is likely to",
-        "risk of harm", "risk of injury", "high risk",
-    ]
 
     def __init__(self, ollama_base_url: str, model: str,
                  timeout: float = 60.0,
@@ -247,28 +391,32 @@ class TaskExtractor:
 Read the task brief and dataset information above very carefully.
 
 Reason step-by-step about the problem, then commit your analysis using EXACTLY \
-this format (fill every field — do not leave blanks):
+this format. Write none for any field the brief and the data do not determine; \
+never invent a value to fill a field:
 
 --- SCOPE ANALYSIS ---
 BUSINESS_GOAL: <one sentence: what outcome the organisation needs>
 ENTITY_UNIT: per <entity type, e.g. establishment / customer / patient / loan>
-TASK_TYPE: <binary_classification | multiclass_classification | regression | timeseries_forecasting | anomaly_detection>
+TASK_TYPE: <binary_classification | multiclass_classification | regression | timeseries_forecasting | anomaly_detection | clustering>
 TASK_TYPE_REASON: <cite the EXACT phrase from the brief that determines this>
-TARGET_COLUMN: <exact column name if already in data, OR "DERIVE: <condition>">
+TARGET_COLUMN: <exact column name if already in data, OR "DERIVE: <condition the brief states>", OR none>
 AGGREGATION: <needed | not_needed>
-AGGREGATION_KEY: <column name to group by, e.g. establishment_id — NOT a category code like naics_code>
-METRIC: <pr_auc | roc_auc | f1 | rmse | mae | r2 | mase — cite source or justify>
+AGGREGATION_KEY: <column name to group by, or none>
+METRIC: <pr_auc | roc_auc | f1 | rmse | mae | r2 | mase, or none — cite source or justify>
 SECONDARY_FILE: <yes | no>
 SECONDARY_FILE_REASON: <which file holds the target labels, or "n/a">
-SPECIFIC_STEPS: <pipe-separated list of non-standard steps, e.g. risk_ranking | output_csv | shap_values>
+SPECIFIC_STEPS: <pipe-separated list of the deliverables the brief explicitly asks for, in its own words, or none>
 --- END SCOPE ---
 
-MANDATORY RULES you must follow:
-- "predict which [entities] will [event]" = ALWAYS binary_classification (one prediction per entity)
-- "at risk of", "likely to have", "serious harm event" = ALWAYS binary_classification
-- If the raw data has one row per incident/transaction but prediction is per business/customer,
-  aggregation IS needed and the key is the entity ID (e.g. establishment_id, customer_id)
-- NEVER use a category code (naics_code, sic_code, zip_code) as aggregation key when an entity ID exists
+RULES:
+- Supervised learning needs a labelled outcome. Choose a classification or regression
+  type only when the data holds the outcome column, or the brief itself states the
+  condition that defines it. Words about risk, fraud or concern do not create a label.
+  With no labelled outcome, the task is anomaly_detection (finding unusual records or
+  entities) or clustering, and TARGET_COLUMN is none.
+- Aggregation is needed only when the brief asks for results per entity while the
+  rows are finer grained. The key is then the entity's identifier, never a category
+  code (naics_code, sic_code, zip_code).
 - A binary flag derived from a FUTURE dataset = requires_secondary_file = yes
 - If the brief names a specific metric (PR-AUC, ROC-AUC, RMSE), use that EXACTLY"""
 
@@ -280,7 +428,7 @@ MANDATORY RULES you must follow:
         Returns the structured scope text; empty string on failure.
         """
         prompt = f"{context}\n\n{self._SCOPE_PROMPT}"
-        raw = self._llm_call_think(prompt, max_tokens=1500)
+        raw = self._llm_call_think(prompt, max_tokens=_SCOPE_TOKENS)
         return raw or ""
 
     def _parse_scope_analysis(self, scope_text: str) -> dict:
@@ -304,6 +452,11 @@ MANDATORY RULES you must follow:
             val = val.strip()
             if not val or val.startswith("<"):
                 continue  # placeholder — skip
+            if val.strip(" .\"'`").lower() in ("none", "n/a", "na", "null", "not applicable"):
+                # An explicit "none" is an answer: nothing to use as a prior.
+                if key == "AGGREGATION":
+                    priors["AGGREGATION"] = "not_needed"
+                continue
 
             if key == "TASK_TYPE":
                 # Normalise to known values
@@ -364,21 +517,33 @@ MANDATORY RULES you must follow:
 
         return priors
 
-    def _llm_call_think(self, prompt: str, max_tokens: int = 1500) -> str:
-        """Ollama call with thinking enabled — uses scope_model, longer timeout."""
+    def _llm_call_think(self, prompt: str, max_tokens: int = 700) -> str:
+        """Ollama call with thinking enabled — uses scope_model, longer timeout.
+
+        This is the one call in the agent that still thinks, because the scope
+        analysis it produces seeds every later extraction. Thinking tokens are
+        generated at the same rate as answer tokens, so the budget is the cost:
+        on a local model at ~13 tok/s, 1500 tokens is about two minutes for this
+        single call. 700 keeps the reasoning and halves the wait. Raise
+        DSAGENT_SCOPE_TOKENS if scope analyses come back truncated.
+        """
         try:
             r = httpx.post(
-                f"{self.base_url}/api/generate",
+                # /api/chat, because a harmony-format reasoning model returns an
+                # empty `response` on /api/generate and puts everything in its
+                # thinking channel. See agent/api/llm.py._generate.
+                f"{self.base_url}/api/chat",
                 json={
                     "model": self.scope_model,
-                    "prompt": prompt,
+                    "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
+                    "keep_alive": _KEEP_ALIVE,
                     "options": {"num_predict": max_tokens, "temperature": 0.1},
                 },
                 timeout=self.timeout * 3,
             )
             r.raise_for_status()
-            raw = (r.json().get("response") or "").strip()
+            raw = ((r.json().get("message") or {}).get("content") or "").strip()
             # If thinking happened, keep only the post-think response
             if "</think>" in raw:
                 raw = raw.split("</think>", 1)[1].strip()
@@ -390,27 +555,17 @@ MANDATORY RULES you must follow:
 
     # ── call 1: task type ─────────────────────────────────────────────
 
-    def _keyword_binary_check(self, context: str) -> tuple[str, float] | None:
-        """Return ("binary_classification", 0.92) if strong binary keywords found."""
-        ctx_lower = context.lower()
-        for kw in self.BINARY_KEYWORDS:
-            if kw in ctx_lower:
-                return ("binary_classification", 0.92)
-        return None
-
     def _call_task_type(
         self, context: str, prior: str | None = None
     ) -> tuple[str, float, str]:
-        # Fast path 1: explicit binary keywords in the document text
-        keyword_result = self._keyword_binary_check(context)
-        if keyword_result is not None:
-            task_type, confidence = keyword_result
-            return (task_type, confidence, "")
-
-        # Fast path 2: scope analysis already committed to a task type
+        # Fast path: the scope analysis already committed to a task type. The
+        # task type is the model's reading of the brief, not a phrase match:
+        # a keyword list here turned "high risk" or "at least one" into binary
+        # classification even when the data held no label to classify.
         if prior and prior in (
             "binary_classification", "multiclass_classification",
             "regression", "timeseries_forecasting", "anomaly_detection",
+            "clustering",
         ):
             return (prior, 0.90, "")
 
@@ -504,6 +659,10 @@ MANDATORY RULES you must follow:
         prior_needed: str | None = None,
         prior_key: str | None = None,
     ) -> tuple[bool, str]:
+        # The scope already decided no aggregation: asking again with an
+        # entity-column hint only invites a key the task does not need.
+        if prior_needed == "not_needed":
+            return (False, "")
         # Use scope priors if both aggregation decision and key are committed
         if prior_needed is not None and prior_key:
             needed = prior_needed == "needed"
@@ -588,6 +747,10 @@ MANDATORY RULES you must follow:
         explicit = self._scan_explicit_metric(context)
         if explicit is not None:
             return explicit
+        # Unlabelled tasks have no ground truth to score against, so a
+        # supervised metric such as pr_auc would be invented, not chosen.
+        if task_type in ("anomaly_detection", "clustering"):
+            return ""
         # Fast path 2: scope analysis committed to a metric
         if prior:
             return prior
@@ -833,22 +996,35 @@ Otherwise set clarification_needed to null.
 
     # ── LLM call wrapper ──────────────────────────────────────────────
 
-    def _llm_call(self, prompt: str, max_tokens: int = 200) -> str:
+    def _llm_call(self, prompt: str, max_tokens: int = 700) -> str:
         """POST to Ollama, strip <think> blocks. Returns "" on any failure."""
+        body = {
+            "model": self.model,
+            # /api/chat shape; see _llm_call_think for why.
+            "messages": [{"role": "user", "content": f"/no_think\n{prompt}"}],
+            "stream": False,
+            "format": "json",
+            "keep_alive": _KEEP_ALIVE,
+            "options": {"num_predict": max_tokens, "temperature": 0.0},
+        }
+        # Only suppress thinking when the configured model benefits from it.
+        # A reasoning model given `think: false` returns its raw working instead
+        # of an answer, which blanked every extraction call. See
+        # agent/api/llm.py DISABLE_THINK.
+        if _DISABLE_THINK:
+            body["think"] = False
         try:
-            r = httpx.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": f"/no_think\n{prompt}",
-                    "stream": False,
-                    "format": "json",
-                    "options": {"num_predict": max_tokens, "temperature": 0.0},
-                },
-                timeout=self.timeout,
-            )
+            r = httpx.post(f"{self.base_url}/api/chat", json=body,
+                           timeout=self.timeout)
+            if r.status_code == 400:
+                # Older Ollama rejects `think`. Retry without it rather than
+                # returning "" and silently losing the extraction.
+                r = httpx.post(
+                    f"{self.base_url}/api/chat",
+                    json={k: v for k, v in body.items() if k != "think"},
+                    timeout=self.timeout)
             r.raise_for_status()
-            raw = (r.json().get("response") or "").strip()
+            raw = ((r.json().get("message") or {}).get("content") or "").strip()
             # Strip closed <think>...</think> blocks
             raw = self.THINK_PATTERN.sub("", raw).strip()
             # Strip unclosed <think> tail

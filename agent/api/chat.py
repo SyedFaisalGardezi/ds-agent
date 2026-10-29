@@ -20,13 +20,14 @@ Endpoints (mounted at /chat):
 """
 from __future__ import annotations
 
-import shutil
+import logging
+import os
 import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -42,46 +43,42 @@ from agent.pipeline.evaluator.leaderboard import Leaderboard
 _UPLOAD_DIR = Path("outputs/uploads")
 
 # Extensions auto-discovered when scanning a working directory
+log = logging.getLogger("dsagent.chat")
+
 _DATA_EXTS  = {".csv", ".parquet", ".xlsx", ".xls", ".tsv", ".feather"}
 _BRIEF_EXTS = {".pdf", ".md", ".txt", ".rst"}
 
 
+def _nearest_existing_dir(p: Path) -> str:
+    """A sibling directory whose name matches `p` apart from case, surrounding
+    spaces, or trailing punctuation, so a failed workdir can name the one the
+    user meant. A path copied out of a sentence keeps the full stop that ended
+    it, which is the mistake this catches. Empty when there is no near match.
+    """
+    def _key(name: str) -> str:
+        return name.strip().rstrip(". ").lower()
+
+    try:
+        want = _key(p.name)
+        if not want:
+            return ""
+        for sib in p.parent.iterdir():
+            if sib.name != p.name and sib.is_dir() and _key(sib.name) == want:
+                return str(sib)
+    except OSError:
+        pass
+    return ""
+
+
 def _load_secondary(kernel: SessionKernel, path: Path, var_name: str) -> str:
     """Load a secondary data file into the kernel as `var_name` (e.g. df2)."""
-    ext = path.suffix.lower()
-    try:
-        if ext == ".csv":
-            code = (
-                f"import pandas as pd\n"
-                f"{var_name} = pd.read_csv(r'{path}')\n"
-                f"print(f'{var_name}: {{len({var_name})}} rows × {{len({var_name}.columns)}} cols')"
-            )
-        elif ext == ".parquet":
-            code = (
-                f"import pandas as pd\n"
-                f"{var_name} = pd.read_parquet(r'{path}')\n"
-                f"print(f'{var_name}: {{len({var_name})}} rows × {{len({var_name}.columns)}} cols')"
-            )
-        elif ext in (".xlsx", ".xls"):
-            code = (
-                f"import pandas as pd\n"
-                f"{var_name} = pd.read_excel(r'{path}')\n"
-                f"print(f'{var_name}: {{len({var_name})}} rows × {{len({var_name}.columns)}} cols')"
-            )
-        elif ext == ".tsv":
-            code = (
-                f"import pandas as pd\n"
-                f"{var_name} = pd.read_csv(r'{path}', sep='\\t')\n"
-                f"print(f'{var_name}: {{len({var_name})}} rows × {{len({var_name}.columns)}} cols')"
-            )
-        else:
-            return f"Unsupported format `{ext}` for secondary file."
-        result = kernel.execute(code)
-        if result.error:
-            return f"Could not load `{path.name}`: {result.error}"
-        return result.stdout.strip() or f"Loaded as `{var_name}`."
-    except Exception as exc:
-        return f"Could not load `{path.name}`: {exc}"
+    from agent.api.data_loader import load
+    result = load(path)
+    if result.df is None or result.df.empty:
+        return f"Could not load {path.name}: {result.error or 'No data rows found'}"
+    kernel.invalidate_analysis()
+    kernel.namespace[var_name] = result.df
+    return f"Loaded {len(result.df)} rows as {var_name}."
 
 
 class DataBody(BaseModel):
@@ -91,7 +88,15 @@ class DataBody(BaseModel):
 
 class WorkDirBody(BaseModel):
     path: str = Field(..., description="absolute path to the session working directory")
-    create: bool = Field(True, description="create the directory if it doesn't exist")
+    # Defaults to False on purpose. A working directory is one you point at, so
+    # a path that does not exist is a typo, and creating it silently hands the
+    # session an empty directory that looks like it worked.
+    create: bool = Field(False, description="create the directory if it doesn't exist")
+
+
+class PendingBody(BaseModel):
+    # None means every staged change; a list selects specific ones by id.
+    ids: list[str] | None = None
 
 
 class MessageBody(BaseModel):
@@ -107,7 +112,43 @@ class MessageBody(BaseModel):
 def make_router(*, store: SessionStore, leaderboard: Leaderboard,
                 jobs: JobRunner, llm: OllamaClient,
                 ltm: Any = None, schema_cache: Any = None) -> APIRouter:
-    router = APIRouter(prefix="/chat", tags=["chat"])
+    active: set[str] = set()
+    active_lock = threading.Lock()
+
+    async def authorize(request: Request):
+        from agent.api.auth import auth_enabled
+        sid = request.path_params.get("sid")
+        if not sid:
+            yield
+            return
+        session = store.get(sid)
+        if session is None:
+            raise HTTPException(404, "Session not found")
+        if auth_enabled() and session.owner_id != getattr(request.state, "user_email", None):
+            raise HTTPException(404, "Session not found")
+        jid = request.path_params.get("jid")
+        if jid:
+            job = jobs.get(jid)
+            if job is None or job.session_id != sid:
+                raise HTTPException(404, "Job not found")
+        # Keep a mutation lease until the HTTP request completes; background
+        # message processing explicitly retains it until the job finishes.
+        mutating = request.method in {"POST", "DELETE", "PUT", "PATCH"}
+        if mutating:
+            with active_lock:
+                if sid in active:
+                    raise HTTPException(409, "This session is busy; wait for its current operation.")
+                active.add(sid)
+        try:
+            yield
+        finally:
+            if mutating:
+                store.persist_session(session)
+            if mutating and not getattr(request.state, "job_started", False):
+                with active_lock:
+                    active.discard(sid)
+
+    router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(authorize)])
 
     # -------- per-session kernel store ---------------------------------- #
 
@@ -117,7 +158,16 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
     def _get_kernel(sid: str) -> SessionKernel:
         with _k_lock:
             if sid not in _kernels:
-                _kernels[sid] = SessionKernel()
+                kernel = SessionKernel()
+                session = store.require(sid)
+                if session.data_path and session.data_path.is_file():
+                    kernel.load_data(session.data_path)
+                for i, path in enumerate(session.data_paths[1:], 2):
+                    if path.is_file():
+                        _load_secondary(kernel, path, f"df{i}")
+                kernel.set_context(session.target, session.brief)
+                kernel.namespace["WORK_DIR"] = session.work_dir
+                _kernels[sid] = kernel
             return _kernels[sid]
 
     def _drop_kernel(sid: str) -> None:
@@ -143,15 +193,18 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
     # -------- session lifecycle ----------------------------------------- #
 
     @router.post("/sessions")
-    def create_session() -> dict[str, Any]:
-        s = store.create()
+    def create_session(request: Request) -> dict[str, Any]:
+        s = store.create(owner_id=getattr(request.state, "user_email", None))
         _get_kernel(s.session_id)  # warm up kernel eagerly
         s.add("system", "Session ready. Upload a CSV/parquet then ask me anything.")
         return s.to_public()
 
     @router.get("/sessions")
-    def list_sessions() -> dict[str, list[str]]:
-        return {"sessions": store.list_ids()}
+    def list_sessions(request: Request) -> dict[str, list[str]]:
+        from agent.api.auth import auth_enabled
+        owner = getattr(request.state, "user_email", None)
+        return {"sessions": [sid for sid in store.list_ids()
+                if not auth_enabled() or store.require(sid).owner_id == owner]}
 
     @router.get("/sessions/{sid}")
     def get_session(sid: str) -> dict[str, Any]:
@@ -169,7 +222,7 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
         s = store.get(sid)
         if s is None:
             raise HTTPException(404, f"session {sid!r} not found")
-        store._sessions.pop(sid, None)  # noqa: SLF001
+        store.delete(sid)
         _drop_kernel(sid)
         return {"deleted": sid}
 
@@ -179,14 +232,18 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
     def set_workdir(sid: str, body: WorkDirBody) -> dict[str, Any]:
         s = store.require(sid)
         p = Path(body.path).expanduser().resolve()
-        if body.create:
-            p.mkdir(parents=True, exist_ok=True)
-        elif not p.is_dir():
-            raise HTTPException(400, f"not a directory: {p}")
+        if not p.is_dir():
+            if body.create:
+                p.mkdir(parents=True, exist_ok=True)
+            else:
+                hint = _nearest_existing_dir(p)
+                raise HTTPException(
+                    400, f"not a directory: {p}"
+                    + (f". Did you mean {hint}?" if hint else ""))
         s.work_dir = p
         kernel = _get_kernel(sid)
         kernel.namespace["WORK_DIR"] = p
-        kernel.execute(f"WORK_DIR = __import__('pathlib').Path(r'{p}')")
+
 
         # Auto-discover data and brief files in the directory
         data_files = sorted(
@@ -212,19 +269,26 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
                 f"SECONDARY_DATA_PATHS = {[str(q) for q in s.data_paths[1:]]!r}"
             )
 
+        from agent.api.agent_tools import is_agent_generated_doc
+
         loaded_briefs: list[str] = []
+        skipped_own: list[str] = []
         for bf in brief_files:
             text = bf.read_text(errors="replace") if bf.suffix.lower() != ".pdf" else ""
             if bf.suffix.lower() == ".pdf":
                 from agent.api.pdf_reader import extract as _pdf_extract
                 summary = _pdf_extract(bf.read_bytes())
                 text = summary.text
+            if is_agent_generated_doc(text):
+                skipped_own.append(f"`{bf.name}`")
+                continue
             s.add_brief(text, bf.name)
             loaded_briefs.append(f"`{bf.name}`")
         if loaded_briefs:
             kernel.set_context(s.target, s.brief)
             # Clear stale TASK_SPEC so understand_task re-runs with the new brief
-            kernel.namespace.pop("TASK_SPEC", None)
+            kernel.invalidate_analysis()
+            kernel.set_context(s.target, s.brief)
 
         # Workspace awareness: map the whole tree (recursive, ignore-aware) so
         # the agent knows every file — not just the top-level data/brief it
@@ -256,12 +320,16 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
                     _text = _dp.read_text(errors="replace")
             except Exception:  # noqa: BLE001
                 continue
+            if is_agent_generated_doc(_text):
+                skipped_own.append(f"`{_dp.relative_to(p)}`")
+                continue
             s.add_brief(_text, _dp.name)
             loaded_briefs.append(f"`{_dp.relative_to(p)}`")
             _sub_loaded += 1
         if _sub_loaded:
             kernel.set_context(s.target, s.brief)
-            kernel.namespace.pop("TASK_SPEC", None)
+            kernel.invalidate_analysis()
+            kernel.set_context(s.target, s.brief)
 
         parts = [f"Working directory set to `{p}`."]
         if workspace_map.get("n_files"):
@@ -278,6 +346,9 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
         if loaded_briefs:
             parts.append("Brief files loaded: " + ", ".join(loaded_briefs)
                          + " — say **'read the instructions'** to extract the task spec.")
+        if skipped_own:
+            parts.append("Not used as instructions (plans the agent wrote "
+                         "earlier): " + ", ".join(skipped_own) + ".")
         if not loaded_data and not loaded_briefs and not workspace_map.get("n_files"):
             parts.append(
                 "No data or brief files found. "
@@ -290,6 +361,30 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
                 "workspace": {"n_files": workspace_map.get("n_files", 0),
                               "n_dirs": workspace_map.get("n_dirs", 0),
                               "counts": workspace_map.get("counts", {})}}
+
+    # -------- pending disk changes (nothing is written without approval) --- #
+
+    @router.get("/sessions/{sid}/pending")
+    def list_pending(sid: str) -> dict[str, Any]:
+        store.require(sid)
+        from agent.api.agent_tools import pending_changes
+        return {"pending": pending_changes(_get_kernel(sid))}
+
+    @router.post("/sessions/{sid}/pending/apply")
+    def apply_changes(sid: str, body: PendingBody) -> dict[str, Any]:
+        s = store.require(sid)
+        from agent.api.agent_tools import apply_pending
+        result = apply_pending(_get_kernel(sid), body.ids, session=s)
+        if result["applied"]:
+            s.add("assistant", "Applied: " + ", ".join(
+                r["summary"] for r in result["applied"]))
+        return result
+
+    @router.post("/sessions/{sid}/pending/discard")
+    def discard_changes(sid: str, body: PendingBody) -> dict[str, Any]:
+        store.require(sid)
+        from agent.api.agent_tools import discard_pending
+        return discard_pending(_get_kernel(sid), body.ids)
 
     @router.post("/sessions/{sid}/data")
     def register_data(sid: str, body: DataBody) -> dict[str, Any]:
@@ -322,9 +417,18 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
         summaries: list[str] = []
         for file in files:
             fname = file.filename or "upload.bin"
-            out = sess_dir / fname
+            if Path(fname).name != fname or "\\" in fname:
+                raise HTTPException(400, "Upload filename must not contain paths")
+            if Path(fname).suffix.lower() in {".pkl", ".pickle"}:
+                raise HTTPException(400, "Executable pickle files are not accepted")
+            out = sess_dir / (uuid.uuid4().hex + Path(fname).suffix.lower())
             with out.open("wb") as fh:
-                shutil.copyfileobj(file.file, fh)
+                size = 0
+                while chunk := file.file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > int(os.environ.get("DSAGENT_UPLOAD_LIMIT_MB", "256")) * 1024 * 1024:
+                        raise HTTPException(413, "Upload exceeds size limit")
+                    fh.write(chunk)
             resolved = out.resolve()
             s.add_data_path(resolved)
             idx = s.data_paths.index(resolved)  # 0-based position
@@ -394,7 +498,8 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
             s.target = combined_target
         kernel.set_context(s.target, s.brief)
         # Clear stale task spec — new brief means we must re-extract
-        kernel.namespace.pop("TASK_SPEC", None)
+        kernel.invalidate_analysis()
+        kernel.set_context(s.target, s.brief)
         fnames = ", ".join(f.filename or "?" for f in files)
         s.add("user", f"uploaded brief(s): {fnames}")
         reply = f"Read {len(files)} brief file(s) ({total_chars:,} chars total): {fnames}."
@@ -412,7 +517,7 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
     # -------- chat ------------------------------------------------------ #
 
     @router.post("/sessions/{sid}/message")
-    def message(sid: str, body: MessageBody) -> dict[str, Any]:
+    def message(sid: str, body: MessageBody, request: Request) -> dict[str, Any]:
         s = store.require(sid)
         kernel = _get_kernel(sid)
         text = body.text.strip()
@@ -425,8 +530,9 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
             s.add("assistant", reply)
             return {"reply": reply, "session": s.to_public()}
 
-        return _spawn_agent_job(s, kernel, text, body.multiagent,
-                                body.allow_writes)
+        result = _spawn_agent_job(s, kernel, text, body.multiagent, body.allow_writes)
+        request.state.job_started = True
+        return result
 
     # -------- background jobs ------------------------------------------- #
 
@@ -455,10 +561,34 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
                 d = result_to_dict(result)
                 d["notebook"] = str(s.notebook_path) if s.notebook_path else None
                 return d
+            except Exception as exc:
+                # Without this the run vanished. The finally below closes the
+                # progress stream, so the UI printed "Done" and moved on, while
+                # the conversation kept no record that anything had been asked:
+                # the turn ended with the user's message and no answer at all.
+                # Say what happened, in the stream and in the conversation, then
+                # re-raise so the job is still marked failed.
+                detail = f"{type(exc).__name__}: {exc}"
+                log.exception("agent job %s failed", jid)
+                _progress.emit(jid, f"Run failed: {detail[:300]}",
+                               tool="error", level="error")
+                reply = (f"The run stopped with an error and could not finish: "
+                         f"{detail[:500]}\n\nAnything completed before this "
+                         f"point is still in the session. Please try again, or "
+                         f"narrow the request.")
+                try:
+                    s.add("assistant", reply)
+                    store.persist_message(s.session_id, "assistant", reply)
+                    store.persist_session(s)
+                except Exception:  # noqa: BLE001
+                    pass            # never let bookkeeping hide the real error
+                raise
             finally:
                 _progress.close(jid)    # signal SSE stream to close
+                with active_lock:
+                    active.discard(s.session_id)
 
-        job = jobs.submit("agent", _work, job_id=jid)
+        job = jobs.submit("agent", _work, job_id=jid, session_id=s.session_id)
         return {
             "job_id": job.job_id,
             "kind": job.kind,
@@ -488,7 +618,11 @@ def make_router(*, store: SessionStore, leaderboard: Leaderboard,
         async def _generate():
             import json as _json
             yield f"data: {_json.dumps({'type': 'connected', 'job_id': jid})}\n\n"
-            deadline = 600          # max 10 min per stream
+            # Outlive the job itself (DSAGENT_JOB_TIMEOUT_S) plus time for its
+            # last step: a 10-minute cap closed the stream mid-analysis, and
+            # the page then showed an empty result for a run still working.
+            from agent.api.jobs import DEFAULT_JOB_TIMEOUT_S
+            deadline = DEFAULT_JOB_TIMEOUT_S + 600
             t0 = __import__("time").time()
             while __import__("time").time() - t0 < deadline:
                 q = _progress.get_queue(jid)

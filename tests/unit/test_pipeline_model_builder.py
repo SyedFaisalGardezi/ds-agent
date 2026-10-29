@@ -193,7 +193,7 @@ def test_trainer_unsupported_task():
 
 
 def test_trainer_unknown_estimator():
-    r = ModelTrainer("regression", {"target": "y", "estimator": "xgb"}).run(_reg_df(50), "run")
+    r = ModelTrainer("regression", {"target": "y", "estimator": "not_a_model"}).run(_reg_df(50), "run")
     assert r.status == "error"
 
 

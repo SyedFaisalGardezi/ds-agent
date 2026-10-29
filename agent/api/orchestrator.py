@@ -23,8 +23,6 @@ from agent.pipeline.eda.profiler import DataProfiler
 from agent.pipeline.eda.quality_scorer import QualityScorer
 from agent.pipeline.eda.statistics import StatisticsAnalyser
 from agent.pipeline.evaluator.leaderboard import Leaderboard
-from agent.pipeline.feature_engineering.generator import FeatureGenerator
-from agent.pipeline.feature_engineering.selector import FeatureSelector
 from agent.pipeline.model_builder.task_detector import TaskDetector
 from agent.pipeline.model_builder.trainer import ModelTrainer
 
@@ -230,7 +228,7 @@ def run_full_pipeline(
 
     augmented = df.copy()
 
-    if not eda_only:
+    if target is not None:
         # 3. mutual information
         try:
             mi = StatisticsAnalyser().mutual_information(df, target=target)
@@ -239,37 +237,9 @@ def run_full_pipeline(
         except Exception as exc:  # noqa: BLE001
             artifacts["mi_error"] = str(exc)
 
-        # 4. feature engineering
-        try:
-            gen = FeatureGenerator(max_pairs=5, max_onehot_cardinality=8)
-            feat = gen.generate(df, target=target)
-            if feat.status == "ok":
-                augmented = feat.data["frame"]
-                artifacts["features"] = {
-                    "frame_shape": list(augmented.shape),
-                    "new_features": [c for c in augmented.columns
-                                     if c not in df.columns][:30],
-                }
-        except Exception as exc:  # noqa: BLE001
-            artifacts["features_error"] = str(exc)
-
-        # 4b. feature selection — keep top 40 features.
-        if target in augmented.columns:
-            try:
-                sel_result = FeatureSelector().shap_selection(
-                    augmented, target=target, top_k=40)
-                if sel_result.status == "ok":
-                    keep = [c for c in sel_result.data.get("selected", [])
-                            if c in augmented.columns]
-                    if keep:
-                        augmented = augmented[keep + [target]]
-                        artifacts["selected_features"] = {
-                            "method": sel_result.data.get("method", "?"),
-                            "n_selected": len(keep),
-                            "selected": keep[:30],
-                        }
-            except Exception as exc:  # noqa: BLE001
-                artifacts["selection_error"] = str(exc)
+        # Learned preprocessing belongs inside the shared training pipeline.
+        # EDA may describe all data, but cannot select training features on test labels.
+        augmented = df.copy()
 
         # 5. task detection
         task = TaskDetector().infer(augmented, target=target)
@@ -333,8 +303,9 @@ def run_full_pipeline(
         out_path=out,
     )
     # Also dump artifacts alongside the notebook for downstream tooling.
-    artifacts_path = out_dir / f"{run_id}_artifacts.json"
+    artifacts_path: Path | None = out_dir / f"{run_id}_artifacts.json"
     try:
+        assert artifacts_path is not None
         artifacts_path.write_text(_json.dumps(artifacts, indent=2, default=str))
     except Exception:  # noqa: BLE001
         artifacts_path = None

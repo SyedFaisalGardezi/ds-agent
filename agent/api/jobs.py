@@ -33,6 +33,7 @@ FINISHED_JOB_TTL_S = float(os.environ.get("DSAGENT_JOB_TTL_S", "1800"))
 class Job:
     job_id: str
     kind: str                          # e.g. "build_notebook", "llm_chat"
+    session_id: str | None = None
     state: str = "pending"             # pending | running | done | failed | timeout
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -80,9 +81,9 @@ class JobRunner:
 
     def submit(self, kind: str, func: Callable[[], Any],
                *, job_id: str | None = None,
-               timeout_s: float | None = None) -> Job:
+               timeout_s: float | None = None, session_id: str | None = None) -> Job:
         jid = job_id or uuid.uuid4().hex[:10]
-        job = Job(job_id=jid, kind=kind,
+        job = Job(job_id=jid, kind=kind, session_id=session_id,
                   timeout_s=timeout_s or DEFAULT_JOB_TIMEOUT_S)
         with self._lock:
             self._prune_locked()

@@ -124,8 +124,8 @@ def test_load_pickle_dataframe(tmp_path, small_df):
     small_df.to_pickle(p)
     r = load(p)
     assert r.data_type == "tabular"
-    assert r.format_name == "pickle"
-    assert r.df is not None
+    assert r.df is None
+    assert r.error  # Pickle can execute arbitrary code and must never be loaded.
 
 
 def test_load_pickle_non_dataframe(tmp_path):

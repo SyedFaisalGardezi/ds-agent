@@ -24,7 +24,13 @@ import httpx
 # Scope/planning model: deep reasoning on task briefs, intent, synthesis.
 SCOPE_MODEL = os.environ.get(
     "DSAGENT_SCOPE_MODEL",
-    "qwen3.8:27b-mlx",
+    # gpt-oss:20b is MoE: ~13 GB on disk, 12 GB resident, ~3.6B active
+    # parameters per token. Measured against qwen3.8:27b-mlx on this project's
+    # own calls (32 GB M1 Pro): router 6.8 s vs 28.4 s, critic 9.1 s vs 17.2 s,
+    # one tool-calling turn 6.7 s vs 65.8 s, prompt processing ~320 tok/s vs
+    # ~80. The 27B needed 20 GB and drove the machine into swap; this one does
+    # not swap at all. It has no vision, so figures are not sent to it.
+    "gpt-oss:20b",
 )
 # Code model: Python/SQL generation, numeric reasoning.
 CODE_MODEL = os.environ.get("DSAGENT_CODE_MODEL", SCOPE_MODEL)
@@ -32,16 +38,41 @@ CODE_MODEL = os.environ.get("DSAGENT_CODE_MODEL", SCOPE_MODEL)
 DEFAULT_MODEL = os.environ.get("DSAGENT_LLM_MODEL", SCOPE_MODEL)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 
-# Context window sent with every request. The Modelfile pins num_ctx=8192,
-# which silently head-truncates long prompts (system prompt goes FIRST).
-# qwen3.8:27b-mlx supports 262K; 16K fits comfortably in 32 GB with the
-# MLX (nvfp4) KV cache. Override via DSAGENT_NUM_CTX.
-NUM_CTX = int(os.environ.get("DSAGENT_NUM_CTX", "16384"))
+# Context window sent with every request. The KV cache is what costs memory,
+# and it grows with the context actually used, not with num_ctx: measured on a
+# 32 GB M1 Pro with gpt-oss:20b, a real 17,753-token prompt at num_ctx=65536
+# left resident memory at 12 GB and swap unchanged. 65536 is therefore verified
+# under genuine load; 131072 allocates cleanly but was only exercised to ~17K
+# tokens. Anything larger buys nothing here, because the agent trims its own
+# prompts long before this.
+#
+# This number is model-specific. qwen3.8:27b-mlx reached 28-29 GB and thrashed
+# at only 16384, so drop this back to 8192 if you switch to a dense 27B.
+NUM_CTX = int(os.environ.get("DSAGENT_NUM_CTX", "65536"))
 
-# Disable qwen3 thinking at the API level (saves 30-60s/call on M-series;
-# the /no_think prompt directive alone is unreliable on distills).
-# Set DSAGENT_THINK=1 to re-enable thinking.
-DISABLE_THINK = os.environ.get("DSAGENT_THINK", "0") != "1"
+# Per-request HTTP timeout. A large local model on a busy machine can take
+# minutes for one tool-calling step, and cutting a call off mid-flight throws
+# away the work and triggers a retry that costs the same again, so this is
+# generous by design. Override with DSAGENT_LLM_TIMEOUT_S.
+LLM_TIMEOUT_S = float(os.environ.get("DSAGENT_LLM_TIMEOUT_S", "600"))
+
+# How long Ollama holds the model in memory after a request. The default is
+# 5 minutes, so a pause between messages costs a full reload of an 18 GB model
+# before the next reply even starts. A working session is longer than that.
+# Set DSAGENT_KEEP_ALIVE="5m" to give memory back sooner, or "-1" to hold the
+# model until Ollama stops.
+KEEP_ALIVE = os.environ.get("DSAGENT_KEEP_ALIVE", "30m")
+
+# Whether to send `think: false`. Default is NOT to send it, because the
+# default model reasons before it answers and suppressing that corrupts the
+# reply rather than shortening it. Measured with gpt-oss:20b on the router
+# prompt: with `think: false` the content came back as 119 characters of raw
+# reasoning ("The user says: ...") and no JSON at all; without it, clean JSON
+# in 5.9 s. Every JSON-mode call in the agent failed this way.
+#
+# A non-reasoning model like qwen3 is the opposite case, where suppressing
+# thinking saves 30-60 s per call. Set DSAGENT_THINK=0 for those.
+DISABLE_THINK = os.environ.get("DSAGENT_THINK", "1") != "1"
 
 INTENTS = ("build", "set_target", "status", "help", "qa", "unknown")
 
@@ -136,7 +167,7 @@ class OllamaClient:
     """Minimal Ollama wrapper. One client per process is fine."""
 
     def __init__(self, model: str = DEFAULT_MODEL, host: str = OLLAMA_HOST,
-                 timeout: float = 180.0, probe_ttl: float = 30.0,
+                 timeout: float = LLM_TIMEOUT_S, probe_ttl: float = 30.0,
                  code_model: str = CODE_MODEL) -> None:
         self.model = model                # scope / planning / reasoning model
         self.code_model = code_model      # coding / SQL / numeric model
@@ -148,6 +179,9 @@ class OllamaClient:
         # True = model accepted a `tools` payload, False = model/Ollama rejected
         # it (so callers fall back to the text ReAct loop without re-probing).
         self._tools_supported: bool | None = None
+        # Whether the model accepted attached images. Set False the first time
+        # one is rejected, so later turns stop paying to send them.
+        self._vision_supported: bool | None = None
 
     # ---- liveness ---------------------------------------------------- #
 
@@ -181,10 +215,22 @@ class OllamaClient:
                   temperature: float = 0.2, max_tokens: int = 512,
                   json_mode: bool = False, think: bool | None = None,
                   _model_override: str | None = None) -> str:
+        # /api/chat, not /api/chat's older sibling /api/generate. A reasoning
+        # model in the harmony format (gpt-oss) writes its working into a
+        # separate `thinking` channel and returns an EMPTY `response` on
+        # /api/generate, so every single-shot call — router, critic, planner —
+        # silently came back blank. /api/chat returns the answer in
+        # message.content and works the same for non-reasoning models, so this
+        # is the endpoint for both.
+        messages: list[dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         body: dict[str, Any] = {
             "model": _model_override or self.model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": False,
+            "keep_alive": KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
@@ -192,14 +238,14 @@ class OllamaClient:
                 "stop": self._STOP_TOKENS,
             },
         }
-        if system:
-            body["system"] = system
         if json_mode:
             body["format"] = "json"
-        # qwen3 thinking off at API level unless explicitly requested.
+        # qwen3 thinking off at API level unless explicitly requested. A
+        # reasoning model ignores this and thinks anyway, which is why the
+        # callers' token budgets have to cover the thinking as well.
         if think is False or (think is None and DISABLE_THINK):
             body["think"] = False
-        raw = self._post_llm("/api/generate", body, "response")
+        raw = self._post_llm("/api/chat", body, "message")
         return self._strip_special_tokens(raw)
 
     def _post_llm(self, path: str, body: dict[str, Any],
@@ -240,6 +286,10 @@ class OllamaClient:
         # Unclosed <think> at end → strip from opener onwards.
         if "<think>" in cleaned and "</think>" not in cleaned:
             cleaned = cleaned.split("<think>", 1)[0]
+        elif "</think>" in cleaned:
+            # Closing tag with no opener: the model reasoned first and only
+            # marked the end. Keep what follows, or the user reads its notes.
+            cleaned = cleaned.split("</think>", 1)[1]
         return cleaned.strip()
 
     # ---- intent ----------------------------------------------------- #
@@ -317,6 +367,7 @@ class OllamaClient:
             "model": self.model,
             "messages": payload_messages,
             "stream": False,
+            "keep_alive": KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
@@ -329,6 +380,11 @@ class OllamaClient:
         raw = self._post_llm("/api/chat", body, "message")
         raw = self._strip_special_tokens(raw)
         return self._strip_thinking(raw)
+
+    def supports_vision(self) -> bool | None:
+        """None until an image has been tried, then True/False. Callers use it
+        to stop attaching figures to a model that cannot read them."""
+        return self._vision_supported
 
     def supports_tools(self) -> bool | None:
         """Tri-state cache of native function-calling support.
@@ -371,6 +427,7 @@ class OllamaClient:
             "messages": payload_messages,
             "tools": tools,
             "stream": False,
+            "keep_alive": KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
@@ -389,14 +446,31 @@ class OllamaClient:
                 body = {k: v for k, v in body.items() if k != "think"}
                 r = httpx.post(f"{self.host}/api/chat", json=body,
                                timeout=self._timeout)
+            # A text-only model rejects attached images. Drop them and retry
+            # BEFORE the tools check below, or a vision failure would be read
+            # as "this model cannot call tools" and disable the agent loop.
+            if r.status_code == 400 and any(
+                    m.get("images") for m in payload_messages):
+                self._vision_supported = False
+                body["messages"] = [{k: v for k, v in m.items() if k != "images"}
+                                    for m in payload_messages]
+                r = httpx.post(f"{self.host}/api/chat", json=body,
+                               timeout=self._timeout)
             # A 400 mentioning tools means this model can't do native calling.
             if r.status_code == 400 and "tool" in r.text.lower():
+                # The genuine "this model does not support tools" reply. This is
+                # a permanent property of the model, so latch it: every later
+                # turn skips native calling and uses the text loop.
                 self._tools_supported = False
                 return None
             r.raise_for_status()
         except httpx.HTTPStatusError:
-            # Non-tool 4xx/5xx: treat as unsupported so we degrade, not crash.
-            self._tools_supported = False
+            # A non-tool 4xx/5xx: a context overflow, a transient 500, a bad
+            # schema for THIS call. It says nothing about whether the model can
+            # call tools, so do NOT latch _tools_supported off — latching it
+            # here disables native tool-calling for the whole process after a
+            # single hiccup, and every later turn then silently falls back to
+            # the text loop and fabricates. Degrade this one turn only.
             return None
 
         self._tools_supported = True
@@ -442,3 +516,220 @@ class OllamaClient:
             return ChatResult(text=text, available=True)
         except Exception as exc:  # noqa: BLE001
             return ChatResult(text=f"(LLM error: {exc})", available=False)
+
+
+# ── Anthropic (Claude API) backend ────────────────────────────────────────────
+# The Claude API is a separate product from a claude.ai subscription: the key
+# comes from console.anthropic.com and is billed there. Selected with
+# DSAGENT_LLM_BACKEND=anthropic; the key is read from ANTHROPIC_API_KEY.
+ANTHROPIC_API_URL = os.environ.get(
+    "ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+ANTHROPIC_MODEL = os.environ.get("DSAGENT_ANTHROPIC_MODEL", "claude-sonnet-5")
+ANTHROPIC_VERSION = os.environ.get("ANTHROPIC_VERSION", "2023-06-01")
+
+
+class AnthropicClient(OllamaClient):
+    """Claude API backend, a drop-in replacement for OllamaClient.
+
+    Implements the same transport surface the agent calls — `_generate`,
+    `_chat`, `chat_with_tools`, `is_available`, `supports_tools` — over the
+    Anthropic Messages API, so the runner and tools do not change. The
+    transport-agnostic helpers (`_strip_thinking`, `_strip_special_tokens`,
+    `classify_intent`, `generate_code`, `answer`) are inherited unchanged.
+
+    The one real translation is tool calling: the agent loop builds Ollama-style
+    messages (assistant `tool_calls` with no ids, then `{"role":"tool"}`
+    results), and the Messages API needs matched `tool_use` / `tool_result`
+    blocks. `_to_anthropic_messages` synthesises ids and pairs each result to
+    its call in order.
+    """
+
+    def __init__(self, model: str | None = None, *,
+                 api_key: str | None = None,
+                 host: str = ANTHROPIC_API_URL,
+                 timeout: float = LLM_TIMEOUT_S) -> None:
+        # Read the model override at construction, not import, so a .env loaded
+        # after this module was imported still takes effect.
+        self.model = model or os.environ.get(
+            "DSAGENT_ANTHROPIC_MODEL", "claude-sonnet-5")
+        self.code_model = self.model
+        self.host = host.rstrip("/")
+        self._timeout = timeout
+        self._api_key = api_key if api_key is not None else os.environ.get(
+            "ANTHROPIC_API_KEY", "")
+        # Claude supports native tool use and vision; no probing needed.
+        self._tools_supported = True
+        self._vision_supported = True
+
+    # ---- liveness ----------------------------------------------------- #
+
+    def is_available(self) -> bool:
+        return bool(self._api_key)
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def supports_vision(self) -> bool:
+        return True
+
+    # ---- transport ---------------------------------------------------- #
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self._api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+
+    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+        r = httpx.post(f"{self.host}/v1/messages", json=body,
+                       headers=self._headers(), timeout=self._timeout)
+        if r.status_code >= 400:
+            # Surface the API's own message (e.g. "credit balance is too low",
+            # "model not found") instead of a bare "400 Bad Request", so the
+            # error the agent shows the user is actionable.
+            detail = ""
+            try:
+                detail = (r.json().get("error", {}) or {}).get("message", "")
+            except Exception:
+                detail = ""
+            raise RuntimeError(
+                f"Anthropic API {r.status_code}: {detail or r.text[:300]}")
+        return r.json()
+
+    @staticmethod
+    def _text_from(content: Any) -> str:
+        parts = [b.get("text", "") for b in (content or [])
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "".join(parts).strip()
+
+    def _generate(self, prompt: str, *, system: str | None = None,
+                  temperature: float = 0.2, max_tokens: int = 512,
+                  json_mode: bool = False, think: bool | None = None,
+                  _model_override: str | None = None) -> str:
+        sys_prompt = system or ""
+        if json_mode:
+            sys_prompt = ((sys_prompt + "\n\n") if sys_prompt else "") + (
+                "Respond with only a single valid JSON object. "
+                "No prose, no markdown code fences.")
+        body: dict[str, Any] = {
+            "model": _model_override or self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        # `temperature` is rejected by newer Claude models (they manage sampling
+        # themselves), so it is not sent. The agent runs deterministically (0)
+        # anyway. `temperature` is kept in the signature for interface parity.
+        _ = temperature
+        if sys_prompt:
+            body["system"] = sys_prompt
+        return self._text_from(self._post(body).get("content"))
+
+    def _chat(self, messages: list[dict], *, system: str | None = None,
+              temperature: float = 0.3, max_tokens: int = 2048) -> str:
+        _ = temperature  # not sent; see _generate
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "assistant" if m.get("role") == "assistant" else "user",
+                 "content": m.get("content", "")}
+                for m in messages
+            ],
+        }
+        if system:
+            body["system"] = system
+        return self._text_from(self._post(body).get("content"))
+
+    # ---- native tool calling ------------------------------------------ #
+
+    @staticmethod
+    def _convert_tools(tools: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for t in tools or []:
+            fn = t.get("function", t) if isinstance(t, dict) else {}
+            out.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": (fn.get("parameters")
+                                 or {"type": "object", "properties": {}}),
+            })
+        return out
+
+    @staticmethod
+    def _parse_args(a: Any) -> dict:
+        if isinstance(a, dict):
+            return a
+        if isinstance(a, str):
+            try:
+                v = json.loads(a)
+                return v if isinstance(v, dict) else {"value": v}
+            except Exception:
+                return {}
+        return {}
+
+    def _to_anthropic_messages(self, messages: list[dict]) -> list[dict]:
+        conv: list[dict] = []
+        cid_n = 0
+        i, n = 0, len(messages)
+        while i < n:
+            m = messages[i]
+            role = m.get("role")
+            if role == "assistant":
+                blocks: list[dict] = []
+                txt = (m.get("content") or "").strip()
+                if txt:
+                    blocks.append({"type": "text", "text": txt})
+                ids: list[str] = []
+                for c in (m.get("tool_calls") or []):
+                    fn = c.get("function", {}) if isinstance(c, dict) else {}
+                    cid = f"call_{cid_n}"
+                    cid_n += 1
+                    blocks.append({
+                        "type": "tool_use", "id": cid,
+                        "name": fn.get("name", ""),
+                        "input": self._parse_args(fn.get("arguments")),
+                    })
+                    ids.append(cid)
+                if not blocks:
+                    blocks = [{"type": "text", "text": "(continuing)"}]
+                conv.append({"role": "assistant", "content": blocks})
+                # Pair the tool messages that follow with these calls, in order.
+                j = i + 1
+                results: list[dict] = []
+                for cid in ids:
+                    if j < n and messages[j].get("role") == "tool":
+                        results.append({
+                            "type": "tool_result", "tool_use_id": cid,
+                            "content": messages[j].get("content", ""),
+                        })
+                        j += 1
+                if results:
+                    conv.append({"role": "user", "content": results})
+                i = j
+            elif role == "tool":
+                i += 1  # already consumed with its assistant turn
+            else:
+                conv.append({"role": "user", "content": m.get("content", "")})
+                i += 1
+        return conv
+
+    def chat_with_tools(self, messages: list[dict], tools: list[dict], *,
+                        system: str | None = None, temperature: float = 0.0,
+                        max_tokens: int = 1024,
+                        think: bool | None = None) -> dict | None:
+        _ = temperature  # not sent; see _generate
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": self._to_anthropic_messages(messages),
+            "tools": self._convert_tools(tools),
+        }
+        if system:
+            body["system"] = system
+        content = self._post(body).get("content") or []
+        calls = [{"function": {"name": b.get("name", ""),
+                               "arguments": b.get("input") or {}}}
+                 for b in content
+                 if isinstance(b, dict) and b.get("type") == "tool_use"]
+        return {"content": self._text_from(content), "tool_calls": calls}

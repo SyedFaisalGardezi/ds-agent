@@ -11,9 +11,9 @@ Config keys (all optional):
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.ensemble import (
@@ -25,21 +25,14 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-    roc_auc_score,
     silhouette_score,
 )
-from sklearn.model_selection import train_test_split
 
 from agent.core.types import ToolResult
 from agent.pipeline.base import PipelineStage
 
 _CLASSIF = {"binary_classification", "multiclass_classification"}
-_MODEL_DIR = __import__("pathlib").Path("outputs/models")
+_MODEL_DIR = Path("outputs/models")
 
 
 class ModelTrainer(PipelineStage):
@@ -83,7 +76,7 @@ class ModelTrainer(PipelineStage):
     # ---- run --------------------------------------------------------- #
 
     def run(self, df: pd.DataFrame, run_id: str,
-            work_dir: __import__("pathlib").Path | None = None) -> ToolResult:
+            work_dir: Path | None = None) -> ToolResult:
         try:
             if self._task_type in _CLASSIF or self._task_type == "regression":
                 return self._supervised(df, run_id=run_id, work_dir=work_dir)
@@ -100,7 +93,7 @@ class ModelTrainer(PipelineStage):
                               math_trace="", error=f"{type(exc).__name__}: {exc}")
 
     def _save_model(self, model: object, run_id: str,
-                    work_dir: __import__("pathlib").Path | None) -> str | None:
+                    work_dir: Path | None) -> str | None:
 
         import joblib
         out_dir = (work_dir / "models") if work_dir else _MODEL_DIR
@@ -113,57 +106,20 @@ class ModelTrainer(PipelineStage):
             return None
 
     def _supervised(self, df: pd.DataFrame, run_id: str = "run",
-                    work_dir: __import__("pathlib").Path | None = None) -> ToolResult:
-        X, y = self._split_xy(df)
-        is_classif = self._task_type in _CLASSIF
-        y_fit = pd.factorize(y)[0] if is_classif and y.dtype == object else y
-        if is_classif and not np.issubdtype(np.asarray(y_fit).dtype, np.number):
-            y_fit = pd.factorize(y_fit)[0]
-        test_size = float(self._config.get("test_size", 0.2))
-        rs = int(self._config.get("random_state", 0))
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X.to_numpy(), np.asarray(y_fit),
-            test_size=test_size, random_state=rs,
-            stratify=np.asarray(y_fit) if is_classif else None,
-        )
-        model = self._pick_supervised(is_classif)
-        model.fit(X_tr, y_tr)
-        pred = model.predict(X_te)
-        metrics: dict[str, float] = {}
-        if is_classif:
-            metrics["accuracy"] = float(accuracy_score(y_te, pred))
-            metrics["f1_macro"] = float(f1_score(y_te, pred, average="macro"))
-            if hasattr(model, "predict_proba") and len(np.unique(y_tr)) == 2:
-                try:
-                    proba = model.predict_proba(X_te)[:, 1]
-                    metrics["roc_auc"] = float(roc_auc_score(y_te, proba))
-                except Exception:
-                    pass
-        else:
-            metrics["mae"] = float(mean_absolute_error(y_te, pred))
-            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_te, pred)))
-            metrics["r2"] = float(r2_score(y_te, pred))
-        model_path = self._save_model(model, run_id, work_dir)
-        return ToolResult(
-            status="ok",
-            data={"model": model, "metrics": metrics,
-                  "feature_names": list(X.columns),
-                  "task": self._task_type, "n_train": int(len(y_tr)),
-                  "n_test": int(len(y_te)),
-                  "model_path": model_path},
-            explanation=(
-                f"Trained {type(model).__name__} ({self._task_type}); "
-                + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-                + (f" | saved: {model_path}" if model_path else "")
-            ),
-            math_trace=(
-                "θ̂ = argmin_θ Σ ℓ(y_i, f_θ(x_i)); "
-                "metrics evaluated on held-out split."
-            ),
-        )
+                    work_dir: Path | None = None) -> ToolResult:
+        from agent.pipeline.model_builder.supervised import train
+        data = train(df, target=self._config["target"], task_type=self._task_type,
+                     models=[self._config.get("estimator", "rf")],
+                     group=self._config.get("group_column"),
+                     time_column=self._config.get("time_column"),
+                     test_size=float(self._config.get("test_size", 0.2)),
+                     seed=int(self._config.get("random_state", 0)))
+        return ToolResult(status="ok", data=data,
+                          explanation=f"Trained {data['best_name']} with untouched hold-out metrics: {data['metrics']}",
+                          math_trace=data["math_trace"])
 
     def _clustering(self, df: pd.DataFrame, run_id: str = "run",
-                    work_dir: __import__("pathlib").Path | None = None) -> ToolResult:
+                    work_dir: Path | None = None) -> ToolResult:
         X = df.select_dtypes("number").fillna(0.0)
         if X.shape[0] < 2 or X.shape[1] == 0:
             return ToolResult(status="error", data=None,
@@ -186,7 +142,7 @@ class ModelTrainer(PipelineStage):
         )
 
     def _anomaly(self, df: pd.DataFrame, run_id: str = "run",
-                 work_dir: __import__("pathlib").Path | None = None) -> ToolResult:
+                 work_dir: Path | None = None) -> ToolResult:
         X = df.select_dtypes("number").fillna(0.0)
         if X.shape[0] < 2:
             return ToolResult(status="error", data=None,

@@ -111,7 +111,7 @@ def test_is_available_cached(monkeypatch):
 def test_generate_returns_response(monkeypatch):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.json.return_value = {"response": "  generated text  "}
+    mock_resp.json.return_value = {"message": {"content": "  generated text  "}}
     monkeypatch.setattr("httpx.post", lambda *a, **kw: mock_resp)
     client = OllamaClient.__new__(OllamaClient)
     client.host = "http://localhost:11434"
@@ -125,7 +125,7 @@ def test_generate_with_system_and_json_mode(monkeypatch):
     captured = {}
     mock_resp = MagicMock()
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.json.return_value = {"response": "ok"}
+    mock_resp.json.return_value = {"message": {"content": "ok"}}
 
     def fake_post(url, json=None, timeout=None):  # noqa: F811
         captured.update(json or {})
@@ -137,7 +137,12 @@ def test_generate_with_system_and_json_mode(monkeypatch):
     client.model = "m"
     client._timeout = 10.0
     client._generate("p", system="sys", json_mode=True)
-    assert captured["system"] == "sys"
+    # _generate posts to /api/chat now, so the system prompt is a message
+    # rather than a top-level field. A harmony-format reasoning model returns an
+    # empty body on /api/generate, which silently blanked every single-shot call.
+    assert captured["messages"][0] == {"role": "system", "content": "sys"}
+    assert captured["messages"][1] == {"role": "user", "content": "p"}
+    assert "prompt" not in captured
     assert captured["format"] == "json"
 
 
@@ -376,3 +381,116 @@ def test_extract_data_dict_lines():
     with patch("pypdf.PdfReader", return_value=mock_reader):
         result = extract(b"fake bytes")
     assert len(result.data_dict_lines) >= 2
+
+
+# ── chat_with_tools: the tools-support latch ─────────────────────────────────
+
+def _tools_client():
+    """A client wired to an unreachable host; every call is mocked."""
+    return OllamaClient(host="http://localhost:1")
+
+
+def _fake_resp(status_code, text="", body=None):
+    import httpx as _httpx
+    r = MagicMock()
+    r.status_code = status_code
+    r.text = text
+    r.json.return_value = body or {}
+    if status_code >= 400:
+        def _raise():
+            raise _httpx.HTTPStatusError(
+                "err", request=_httpx.Request("POST", "http://x"), response=MagicMock())
+        r.raise_for_status.side_effect = _raise
+    else:
+        r.raise_for_status.return_value = None
+    return r
+
+
+def test_chat_with_tools_latches_only_on_unsupported():
+    """A genuine 'does not support tools' 400 latches _tools_supported off."""
+    client = _tools_client()
+    with patch("agent.api.llm.httpx.post",
+               return_value=_fake_resp(400, text="this model does not support tools")):
+        out = client.chat_with_tools([{"role": "user", "content": "hi"}], [])
+    assert out is None
+    assert client._tools_supported is False  # permanent: real model property
+
+
+def test_chat_with_tools_transient_error_does_not_latch():
+    """A non-tool 500 degrades this turn only — it must NOT disable tools.
+
+    Latching here would let one hiccup route every later turn to the text loop,
+    where the model fabricates results instead of running them.
+    """
+    client = _tools_client()
+    with patch("agent.api.llm.httpx.post",
+               return_value=_fake_resp(500, text="internal server error")):
+        out = client.chat_with_tools([{"role": "user", "content": "hi"}], [])
+    assert out is None
+    assert client._tools_supported is not False  # still None → native retried next turn
+
+
+def test_chat_with_tools_success_sets_supported():
+    """A clean tool-call response marks tools supported and returns the message."""
+    client = _tools_client()
+    body = {"message": {"content": "done", "tool_calls": [{"function": {"name": "x"}}]}}
+    with patch("agent.api.llm.httpx.post", return_value=_fake_resp(200, body=body)):
+        out = client.chat_with_tools([{"role": "user", "content": "hi"}], [])
+    assert client._tools_supported is True
+    assert out["tool_calls"] and out["tool_calls"][0]["function"]["name"] == "x"
+
+
+# ── AnthropicClient (Claude API backend) ─────────────────────────────────────
+
+def test_anthropic_is_available_requires_key():
+    from agent.api.llm import AnthropicClient
+    assert AnthropicClient(api_key="").is_available() is False
+    assert AnthropicClient(api_key="k").is_available() is True
+    assert AnthropicClient(api_key="k").supports_tools() is True
+    assert AnthropicClient().model == "claude-sonnet-5"  # Sonnet default
+
+
+def test_anthropic_generate_parses_text_blocks():
+    from agent.api.llm import AnthropicClient
+    c = AnthropicClient(api_key="k")
+    body = {"content": [{"type": "text", "text": "hello "},
+                        {"type": "text", "text": "world"}]}
+    with patch("agent.api.llm.httpx.post", return_value=_fake_resp(200, body=body)):
+        assert c._generate("hi") == "hello world"
+
+
+def test_anthropic_chat_with_tools_parses_tool_use():
+    from agent.api.llm import AnthropicClient
+    c = AnthropicClient(api_key="k")
+    body = {"content": [
+        {"type": "text", "text": "checking"},
+        {"type": "tool_use", "id": "tu_1", "name": "eda_profile", "input": {"x": 1}},
+    ]}
+    tools = [{"type": "function", "function": {
+        "name": "eda_profile", "description": "d",
+        "parameters": {"type": "object", "properties": {}}}}]
+    with patch("agent.api.llm.httpx.post", return_value=_fake_resp(200, body=body)):
+        out = c.chat_with_tools([{"role": "user", "content": "go"}], tools)
+    assert out["content"] == "checking"
+    assert out["tool_calls"] == [
+        {"function": {"name": "eda_profile", "arguments": {"x": 1}}}]
+
+
+def test_anthropic_message_conversion_pairs_tool_results():
+    """Ollama-style tool messages become matched tool_use / tool_result blocks."""
+    from agent.api.llm import AnthropicClient
+    c = AnthropicClient(api_key="k")
+    msgs = [
+        {"role": "user", "content": "explore"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"function": {"name": "eda_profile", "arguments": {}}}]},
+        {"role": "tool", "tool_name": "eda_profile", "content": "shape 5x2"},
+    ]
+    conv = c._to_anthropic_messages(msgs)
+    assert conv[0] == {"role": "user", "content": "explore"}
+    tu = [b for b in conv[1]["content"] if b["type"] == "tool_use"][0]
+    tr = conv[2]["content"][0]
+    assert conv[2]["role"] == "user"
+    assert tr["type"] == "tool_result"
+    assert tr["tool_use_id"] == tu["id"]
+    assert tr["content"] == "shape 5x2"

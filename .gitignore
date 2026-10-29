@@ -47,3 +47,7 @@ graphify-out/
 .coverage
 htmlcov/
 coverage.xml
+
+# Evaluation runs (large; regenerate with python -m evals.run_eval)
+evals/results/
+finetune/data/

@@ -495,7 +495,7 @@ The agent can now search, write, and edit files in the working directory — wit
 - **`search_files`** (agent_tools.py): pure-Python grep (ripgrep exists on the host but the agent runs as a subprocess where the `rg` shell shim doesn't apply, so Python is the robust choice). Ignore-aware walk (`_ws_iter_files`), skips binaries (`_is_probably_text`), regex or literal, optional `glob`, capped results, `file:line: match`.
 - **`edit_file`**: exact `old_string`→`new_string`. 0 matches → error; >1 without `replace_all` → error (ask for more context); else apply. Confined to workdir (`_ws_resolve_within`).
 - **`write_file`**: create or overwrite (needs `overwrite=true` to replace). Confined to workdir. No delete tool (destructive ops are out of scope).
-- **Suggest/Write mode:** `_ws_write_mode(kernel)` returns `write` or `suggest`. In **suggest** mode `edit_file`/`write_file` return a unified diff and touch nothing; in **write** mode they apply. Default is **suggest** (safe). Set per turn via `FILE_WRITE_MODE` on the kernel, which `run_reactive(allow_writes=...)` sets from `MessageBody.allow_writes`; env default `DSAGENT_ALLOW_WRITES` (0). `search_files`/`read_file` always work regardless.
+- **Suggest/Write mode:** `_ws_write_mode(kernel)` returns `write` or `suggest`. In **suggest** mode `edit_file`/`write_file` return a unified diff and touch nothing; in **write** mode they apply. Default is **suggest** (safe). Set per turn via `FILE_WRITE_MODE` on the kernel, which `run_reactive(allow_writes=...)` sets from `MessageBody.allow_writes`; env default `DSAGENT_ALLOW_WRITES` (0). `search_files`/`read_file` always work regardless. **Superseded by section 20**, which adds an `ask` mode and makes it what the toggle turns on.
 - Roles: `coder` gets `search_files`/`read_file`/`write_file`/`edit_file`/`execute_code`/`build_notebook`; `data_engineer` also gets `search_files`.
 - **Web-UI toggle:** a red **Writes** switch beside the Multi-agent switch (`agent/api/static/index.html`), OFF by default, persisted in `localStorage` (`ds_allow_writes`), posts `allow_writes` per message; flipping it prints a system line. Verified in-browser (switch flips, ENABLED message shown).
 - Verified: unit tests cover both modes, non-unique/missing guards, overwrite guard, and path confinement (traversal + absolute-outside rejected for write and edit). 1206 tests pass, coverage 80.91%.
@@ -529,5 +529,210 @@ Four limits in how the agent carried brief and document instructions into prepro
 
 Verified: the requirements checklist renders and skips placeholders, the widened excerpt applies, and the full suite passes. 1217 tests pass, coverage 80.87%. A server restart is required for these to take effect.
 
+## 20. Local-Model Latency, and Approval Before Any Disk Change (2026-09-17)
+
+Two problems surfaced in live use on a 32 GB M1 Pro: runs died part-way through, and the agent created a directory nobody asked for.
+
+### 20.1 Why runs were dying
+Measured against the running Ollama, not inferred: one realistic specialist step (3,480-token prompt, `data_engineer` toolset) took **172.5 s**, one critic call **57.8 s**, generation ran at **13.5 tok/s**, and cold prompt processing at about **80 tok/s**. The client timeout was 180 s, so a single step could exceed it. `qwen3.8:27b-mlx` is 19 GB freshly loaded and reached 28-29 GB after a few large turns at `num_ctx=16384`; the machine swapped (swap use went 4.5 GB to 11.6 GB) and prompt processing collapsed. An identical 3,713-token prompt took 46.6 s cold and **0.3 s** with Ollama's prompt cache warm.
+
+> **Correction (2026-09-18).** This section originally went on to explain the cost as the critic evicting the prompt cache, because it runs a different prompt on `/api/generate` while the loop runs on `/api/chat`. A direct A/B disproved that; see section 21.2. Ollama keeps more than one cache slot, and the loop turn after a standalone critic call still evaluated its prompt in 0.46 s. The swapping and the cold-cache first call account for the numbers above. The critic skip list below stands on its own ground, which is that a critic call costs 20-60 s and a successful file read has nothing to weigh.
+
+Changes:
+- `NUM_CTX` 16384 → **8192**, capping KV-cache growth (`llm.py`).
+- Client timeout 180 s → **600 s** (`DSAGENT_LLM_TIMEOUT_S`). Cutting a call off mid-flight discards the work and triggers a retry that costs the same again.
+- Timeouts are no longer retried (`_is_timeout`), in `_tool_call_loop` and `_run_multiagent_loop`.
+- The critic now skips successful retrieval calls (`_CRITIC_SKIP_TOOLS`: `explore_directory`, `read_file`, `search_files`, `read_instructions`, `write_file`, `edit_file`, `build_notebook`, `scaffold_cicd`, `visualize`). Failures still go through the rule-based path, which costs no LLM call. `DSAGENT_CRITIC_ALL=1` restores per-step critique. **This is a deliberate narrowing of section 19's per-step reflection**: it is kept for the tools whose output should change the plan (`eda_profile`, `quality_check`, `mutual_information`, `deep_eda`, `train_model`, `aggregate_data`, `connect_data`, `understand_task`).
+- `_data_context(..., compact=True)` for the agent loops: the brief excerpt drops from 4000 to 600 chars (the REQUIREMENTS checklist carries the actionable content) and the workspace tree from 25 to 12 lines. The QA path keeps the full brief.
+
+### 20.2 The directory the agent created
+`WorkDirBody.create` defaulted to `True` and the UI hard-coded `create: true`, while the UI printed `Working directory set to <path>.` with a full stop straight after the path. A path copied back out of that line carried the full stop, so `/Prep/WorkForce_DS.` was created as an empty directory and became the workspace. `explore_directory` then returned nothing and the model invented `data/`, `docs/`, `README.md`.
+
+- `create` now defaults to **False**, and the UI sends `create: false`. A missing path is a typo.
+- `_nearest_existing_dir` suggests the sibling that differs only by case, spaces, or trailing punctuation: `not a directory: .../WorkForce_DS. Did you mean .../WorkForce_DS?`
+- The UI no longer prints a full stop after the path, reports the mapped file count, and warns when the directory is empty.
+- `_data_context` states outright that a workspace is empty and tells the agent not to guess filenames.
+
+### 20.3 Approval before any disk change
+Enabling writes now means the agent may **propose** a change, not make one. Third mode `ask` (`_WRITE_MODES = suggest | ask | write`) is what `allow_writes=True` and `DSAGENT_ALLOW_WRITES=1` select; `write` remains for automation and tests.
+
+- `_stage_change` / `_hold_for_approval` put the change on `kernel.namespace["PENDING_CHANGES"]` with its diff, its target, and any folder it would create. Nothing touches disk.
+- `pending_changes` (contents excluded), `apply_pending(ids, session=)`, `discard_pending(ids)`. Records are `kind: "file"` (write content) or `kind: "tool"` (re-run the staging tool with writes applied, used by `deploy_model` whose output includes a joblib binary).
+- Staged at all five write sites: `write_file`, `edit_file`, `_save_sql`, `deploy_model`, `scaffold_cicd`.
+- **No unasked folders:** `write_file` refuses a path whose parent is missing unless `create_dirs=true`, and the schema tells the model to set it only when the user asked for a new folder. Approved folder creations are listed in the record.
+- **No deleting:** there is no delete tool, and `_FORBIDDEN_PATTERNS` in `code_executor.py` now also blocks `os.remove`, `os.unlink`, `os.rmdir`, `os.removedirs`, `Path.unlink()`, `Path.rmdir()`, and `shutil.move`, so `execute_code` cannot route around the queue. The dot-method forms sit outside the leading `\b` group, which cannot match before a literal dot.
+- API: `GET /chat/sessions/{sid}/pending`, `POST .../pending/apply`, `POST .../pending/discard`, each taking `{"ids": [...] | null}`.
+- UI: a Pending changes panel with per-item Approve/Reject plus Approve all/Reject all, the diff, and an amber line when a change creates folders. Verified in-browser: buttons render, diffs are HTML-escaped (no injection from file contents), the folder warning shows.
+
+Verified: 1225 tests pass, `ruff check agent/` clean. The workdir guard was checked against a live server (typo rejected, no directory created; the correct path maps 6 files and loads 4 briefs). A server restart is required for any of this to take effect.
+
+## 21. Output Budgets and the Prompt Cache (2026-09-18)
+
+Follow-up to section 20, after auditing every output cap and every source of latency.
+
+### 21.1 A long document could not be written at all
+The tool-calling turn was capped at **800 tokens**, and when the agent writes a file the file's whole content is an argument to that call. A plan longer than about 600 words truncated the JSON mid-string; `_coerce_tool_args` returns `{}` for unparseable arguments, so the failure surfaced as `write_file needs a 'path'` rather than as "too long". `_TOOL_TURN_TOKENS` (`DSAGENT_TOOL_TURN_TOKENS`) now defaults to **3000**, roughly 2200 words, which still fits inside `num_ctx=8192` beside the prompt and tool schemas. Raise `DSAGENT_NUM_CTX` before raising it much further.
+
+Other caps, audited and left alone: orchestrator turn 700 (delegation only), critic 280, synthesis 1024, QA 2048 with a prompt-level "up to 800 words" instruction that is the real limit for chat answers.
+
+### 21.2 The critic does NOT evict the prompt cache (hypothesis tested and rejected)
+Section 20 hypothesised that the critic was expensive because it runs a different prompt on `/api/generate` while the loop runs on `/api/chat`, dropping the KV cache the loop would otherwise reuse. The critic was rewritten to ask its question as the next turn of the loop's own conversation, and then measured against the original. On the real conversation shape (3,545-token prompt, `data_engineer` tools):
+
+| Step | Wall | Prompt eval |
+| --- | --- | --- |
+| 1. Loop turn, cold | 253.4 s | 88.0 s |
+| 2. Inline critic (shares the prefix) | 50.8 s | 42.1 s |
+| 3. Loop turn after the inline critic | 115.6 s | 1.15 s |
+| 4. Standalone critic on `/api/generate` | 21.5 s | — |
+| 5. Loop turn after the standalone critic | 5.3 s | **0.46 s** |
+
+Step 5 settles it. A standalone critic call does not cost the loop its cached prefix, so Ollama is keeping more than one cache slot. The inline version was also the slower of the two (50.8 s against 21.5 s) because it reprocesses the entire conversation to ask a question about one tool result, where the standalone prompt is about 1,200 tokens.
+
+**The change was reverted.** The critic stays a small standalone `/api/generate` call. `test_critic_asks_on_its_own_prompt_not_through_the_loop` pins that, with the numbers in its docstring so the idea is not retried blind. Prefix reuse itself is real and is working (88.0 s against 0.46 s for the same prompt); it simply was not what the critic was costing.
+
+### 21.3 Other latency work
+- **`keep_alive` (`DSAGENT_KEEP_ALIVE`, default `30m`).** Nothing set it, so Ollama's 5-minute default unloaded the model between messages and the next reply paid an 18 GB reload first. Applied to all three request bodies in `llm.py` and both in `task_extractor.py`.
+- **Thinking budget in `understand_task`.** `_llm_call_think` is the one call that still thinks, and it had 1500 tokens, about two minutes of generation on a local model. Now `_SCOPE_TOKENS` (`DSAGENT_SCOPE_TOKENS`, default 700).
+- **Thinking was never actually off for the five short extraction calls.** They relied on the `/no_think` prompt directive, which `llm.py` already documents as unreliable, and never sent `"think": false`. They do now, with a 400 retry that drops the field for older Ollama rather than silently returning "" and losing the extraction.
+- **Live elapsed seconds in the UI.** A single call can run for minutes with no event between, so the log looked frozen. The newest progress line now ticks its seconds, quietly for anything under 3 s, and stops on done or error.
+
+Not done: token-level streaming of the final answer. It needs the client to read NDJSON and the job stream to carry deltas, and streamed tool calls arrive fragmented, which is the risky part of the loop. The elapsed indicator covers the "is it alive" problem in the meantime.
+
+Verified: 1226 tests pass, `ruff check agent/` clean. The elapsed timer was exercised in-browser (only the newest line ticks, it stops cleanly).
+
+**Still open after this round.** The 253 s cold loop turn in the table above was measured while the machine sat at 9.9 GB of 10 GB swap, so the dominant cost remains memory pressure, not prompt structure. The levers that have not been pulled are a smaller model, collapsing `understand_task`'s 6-8 calls, and trimming tool schemas.
+
+## 22. EDA-Driven Planning, and Letting the Model See Its Plots (2026-09-18)
+
+The complaint was that planning stayed generic: feature engineering and model choice were not being revised once EDA had run. Four causes, all confirmed in code.
+
+### 22.1 Feature engineering was completely EDA-blind
+`train_model` already reads `ML_PLAN` (which `ml_strategy_agent` derives from `DATA_ANALYSIS_REPORT`), so model selection was EDA-driven. `feature_engineering` read none of it. It label-encoded every categorical regardless of cardinality, filled nulls with the median, and built interaction terms from `_num_cols[:5]`, the first five numeric columns in frame order rather than the informative ones.
+
+It now reads `DATA_ANALYSIS_REPORT` and acts on it: drops `leakage_suspects` and `near_constant_cols`, log1p-transforms `skewed_cols`, frequency-encodes `high_cardinality_cols` instead of inventing an ordering over thousands of levels, and builds interactions from `top_mi_features`. With no report present it behaves exactly as before.
+
+On a fixture with a planted leakage column, the old path selected **`leaky` as the single most important feature**; the new path drops it. That is `test_feature_engineering_acts_on_the_eda_report`, which asserts both directions so the cost of running blind is visible.
+
+### 22.2 There was no plan to revise
+The multi-agent path never wrote a plan at all; the orchestrator improvised each round. The deterministic path built a JSON plan before any EDA and only asked "KEEP or revise" per step. Neither had a point at which the approach was reconsidered against evidence.
+
+New `work_plan` tool (registry is now **26 tools**). It writes `WORK_PLAN` to the kernel with sections objective / data_preparation / eda_questions / feature_engineering / modelling / evaluation / deliverables, plus `revision_notes`. Called with `revise=true` after EDA it rewrites the feature, model and evaluation sections against `DATA_ANALYSIS_REPORT` and `EXPLORATION_LOG`, and records what changed and which finding caused it. `revise=true` before any EDA is refused. `save_to` writes the markdown through the approval queue like any other file.
+
+### 22.3 Nothing enforced the order
+`work_plan_is_stale(kernel)` is true when EDA has produced findings the plan has not been revised for. The orchestrator checks it before delegating to `ml_engineer` and returns a BLOCKED message instead, sending the work back to the analyst. So modelling cannot proceed from assumptions once evidence exists.
+
+### 22.4 The model could not see its own plots, or most of its EDA
+Figures were captured as base64 PNG and rendered for the human, never sent to the model, although `qwen3.8:27b-mlx` reads images. Separately, every tool result was truncated to 1500 characters, so an `eda_profile` over 26 columns reached the model as roughly its first third.
+
+- Observations: newest result up to `DSAGENT_OBS_CHARS` (4000), older ones squeezed to 700 so the conversation cannot outgrow `num_ctx`.
+- Figures from the newest step are attached to a user turn as `images`. Verified against the live model: given a histogram of `normal(2, 0.5)` plus 200 points at x=7, it reported a main cluster at x≈2 and a separate spike at x≈7 with frequency about 200. Both correct. Cost about 90 s for a 7 KB image.
+- `_shrink_figure` keeps that affordable. **Charts compress by colour count, not pixel count**: the first implementation resized them, which anti-aliased crisp edges into gradients and made files *larger* (48,112 chars original, 28,512 after resizing to 75% and quantising, 18,140 after quantising alone at full resolution). It now quantises first and only resizes as a fallback, which preserves axis legibility. Measured 48,112 → 19,220 chars.
+- A model that rejects images sets `_vision_supported = False` and later turns stop sending them. The retry that strips images runs **before** the tools check in `chat_with_tools`, or a vision failure would have been misread as "this model cannot call tools" and silently disabled the agent loop.
+
+### 22.5 Two bugs that made the transcript worse than the design
+- **The request could not have worked.** "plan the whole work and save plan in md file" classified as `qa`, and the QA path has no tools, so it described calling `write_file` and wrote nothing. `_asks_for_artifact` now routes a verb of production plus a thing to produce into the tool loop whatever the classifier says.
+- **Thinking leaked to the user.** `_strip_thinking` handled `<think>…</think>` and an unclosed opener but not a lone closing `</think>`, which is what the model emitted. Fixed in both `agent_runner.py` and `llm.py`.
+
+Verified: 1231 tests pass, `ruff check agent/` clean.
+
 ### Optional next steps (beyond the plan)
-Add a warehouse write path behind an explicit opt-in (currently read-only by design); a model-registry/versioning step in `deploy_model`; ONNX export; parallelise independent specialist calls; a pending-edits "apply all" action; a hard completion gate that refuses to finish while a listed requirement is unaddressed.
+Token-streaming the final answer; collapsing `understand_task` from 6-8 calls to 2; trimming tool-schema descriptions; a warehouse write path behind an explicit opt-in (currently read-only by design); a model-registry/versioning step in `deploy_model`; ONNX export; a hard completion gate that refuses to finish while a listed requirement is unaddressed; a smaller local model, since a 19 GB model on a 32 GB machine is the remaining latency floor.
+
+## 23. Planning That Analyses Rather Than Restates (2026-09-18)
+
+The plan read like a summary of the brief. Three causes.
+
+### 23.1 The planner was given almost no data
+`work_plan` passed the model shape plus the first 40 column names. Nothing about dtypes, missingness, cardinality or value ranges, so it had nothing to reason from and could only paraphrase the document.
+
+`_profile_for_planning` now builds real evidence from the frames already in memory: per column dtype, null percentage, distinct count, value lists for low-cardinality columns, ranges and medians for numerics, examples for text, duplicate row count, and the columns common to every file as candidate join keys. No model call, capped at 6000 characters.
+
+On the WorkForce data this surfaces what a planner needs and a column list hides: 151 duplicate rows, `incident_year` constant at 2023, `date_of_death` 100% null yet holding 4 distinct values, `time_of_incident` values like `30:00.0` that are plainly malformed, `total_hours_worked` with exactly 1,000 distinct values across 14,533 rows (an establishment attribute repeated per incident), and `soc_probability` ranging 0 to 5.
+
+### 23.2 The prompt asked for sections, not for thinking
+It now forces the order the user described: read the brief, then analyse it against the data, then decide. New sections `requirement_coverage` (requirement → approach → columns → open question, rendered as a table), `risks`, and EDA split into `eda_questions_task` and `eda_questions_independent`, the latter explicitly the checks a careful analyst runs whatever the task is. The rule is that an entry which would read the same for any dataset is wrong and must be deleted.
+
+### 23.3 One big call could not finish
+Measured: an all-sections call produced about 1,485 tokens in 287 s, truncated intermittently at a 1600-token budget, and ran past the 600 s request timeout once the budget was raised. Planning is now two calls, matching the two stages the work naturally has:
+
+- **Scope** (`_PLAN_SCOPE_PROMPT`): objective, requirement coverage, EDA questions, risks.
+- **Approach** (`_PLAN_APPROACH_PROMPT`): data prep, features, modelling, evaluation, deliverables, written against the settled scope rather than the brief alone.
+
+If the approach half fails, the scope survives and the reply says so. `_extract_json_obj` also repairs a reply cut off mid-JSON: it records the bracket stack at every position, then tries cut points from the end, trimming a dangling comma and closing what was open at that cut. An earlier version computed the stack over the whole string and applied it to a trimmed body, which silently produced wrong nesting.
+
+### 23.4 EDA now has an agenda
+The plan's questions are surfaced in `_data_context` for every specialist, split into the brief's questions and the independent checks, with the independent ones marked not optional. The analyst role and specialist prompt were rewritten around answering them and stating what each answer implies, and a question that cannot be settled counts as a finding. The `work_plan` revision reminder appears in context until the plan has been revised against EDA.
+
+Verified: 1235 tests pass, `ruff check agent/` clean.
+
+## 24. Routing Decided by the Model, Not by Keywords (2026-09-18)
+
+Section 22.5 fixed a routing failure with `_asks_for_artifact`, a list of verbs and a noun regex. That was the wrong mechanism: it only recognised phrasings someone had thought of in advance, so "save the plan to a file" worked and "jot this down somewhere" did not.
+
+The deeper problem was the design underneath it. `run_reactive` called `classify_intent`, which returned one of six topic labels, and then used exactly one bit of that: `intent == "build"` sent the message to the tool loop, everything else to a QA path with no tools at all. So the question "does this need a tool?" was being answered by a model that had never been shown the tools, using a taxonomy sorted by subject matter rather than by what the message asks for. A request to produce something that landed in QA could only ever be described.
+
+`_decide_action` replaces both. One call, in place of the classifier so no extra round trip, which gives the model the tool registry and the compact session state and asks a single question: can this be answered from what is already known, or does it need work doing. The rule it applies is about consequence rather than topic, so anything that should leave a file, a model, a figure, a plan or a new finding behind is "act", and a reply that would have to describe doing the work instead of doing it is "act".
+
+Fallbacks differ by failure kind, which the first version got wrong by treating them alike:
+
+- **Unparseable reply**: the model works but was unclear, so act. The tool loop can still answer a question without calling anything; answering cannot do the reverse.
+- **Raised exception**: the model is unreachable, and the tool loop needs that same model, so answer and let the reply path use its own offline handling.
+
+`OllamaClient.classify_intent` still exists and keeps its tests, but routing no longer uses it.
+
+Verified: 1235 tests pass, `ruff check agent/` clean. `test_router_asks_the_model_and_shows_it_the_tools` pins that the prompt carries the registry and the session state, and covers both fallback directions.
+
+## 25. Switching to gpt-oss:20b (2026-09-18)
+
+The 27B dense model needed ~20 GB and drove a 32 GB machine into 17 GB of swap, which is where the 100-300 s steps came from. Measured head to head on this project's own calls, same inputs, the WorkForce brief and data:
+
+| | qwen3.8:27b-mlx | gpt-oss:20b |
+| --- | --- | --- |
+| Router | 28.4 s | **6.5 s** |
+| Critic | 17.2 s | **9.3 s** |
+| One tool-calling turn | 65.8 s | **6.7 s** |
+| Full two-stage `work_plan` | 227 s for the scope stage alone | **112 s for both stages, all 10 sections** |
+| Prompt processing | ~80 tok/s | **~320 tok/s** |
+| Resident | 20 GB | **12 GB** |
+| Swap growth | yes | **none** |
+
+gpt-oss:20b is MoE: ~3.6B active parameters of 21B. That is why it is fast despite being only slightly smaller on disk.
+
+### 25.1 Two client changes were required, both non-obvious
+**`/api/generate` returns nothing.** gpt-oss is a harmony-format reasoning model: it writes into a separate `thinking` channel and leaves `response` empty on that endpoint. Every single-shot call in the agent — router, critic, both planning stages, and all six `task_extractor` calls — went through `/api/generate` and came back blank. `_generate` and the extractor now post to `/api/chat` and read `message.content`, which behaves identically for non-reasoning models.
+
+**`think: false` corrupts the answer.** Suppressing a reasoning model's thinking does not shorten the reply, it replaces it with raw working. Measured on the router prompt: with `think: false` the content was 119 characters of "The user says: ..." and no JSON; without it, clean JSON in 5.9 s. `DISABLE_THINK` now defaults to NOT sending the field. Set `DSAGENT_THINK=0` for a non-reasoning model like qwen3, where suppressing thinking genuinely saves 30-60 s per call. Stop tokens were ruled out as a cause.
+
+### 25.2 Budgets had to grow, because thinking consumes them
+A reasoning model spends most of its output budget before it answers, so a budget that only covers the answer yields nothing at all. Measured: the planning stage produced 10,147 characters of thinking before emitting the plan, and failed to reach the JSON at 1500 and at 3000 tokens.
+
+`_ROUTER_TOKENS` 60 → 500, `_CRITIC_TOKENS` 280 → 900, `_PLAN_STAGE_TOKENS` 1500 → 8000, `_SCOPE_TOKENS` 700 → 2500, `_TOOL_TURN_TOKENS` 3000 → 4000.
+
+### 25.3 Context window
+`NUM_CTX` 8192 → **65536**. The KV cache grows with the context actually used, not with `num_ctx`: a real 17,753-token prompt at 65536 left resident memory at 12 GB and swap unchanged. 131072 allocates cleanly but was only exercised to ~17K tokens. This number is model-specific; a dense 27B thrashed at 16384.
+
+### 25.4 What was given up
+gpt-oss has no vision, so `DSAGENT_SEND_FIGURES` now defaults to 0. The figure-reading path built in section 22.4 still works and is still tested; it needs a vision model to be useful. Plan prose is also slightly less sharp than the 27B's, whose independent EDA questions cited the exact duplicate counts from the profile.
+
+Verified: 1236 tests pass, `ruff check agent/` clean, and the real `work_plan` on the real brief returns all ten sections in 112 s.
+
+
+## Audit implementation update — 24 September 2026
+
+This update supersedes older keyword-first routing descriptions for the default
+chat entry point. `run_reactive` calls `intent.interpret`, then either answers,
+asks for material clarification, or enters the bounded adaptive tool loop.
+`_execute_tool` validates JSON-schema arguments and checks the concrete action
+against the full request/brief and interpreted constraints. These checks use the
+same local model; they do not guarantee semantic correctness. Mechanically
+restricted code execution and explicit artifact approval remain separate controls.
+
+Generated Python runs in `api/sandbox.py`, not the host SessionKernel. Built-in
+trusted templates still use the kernel. A timed-out native kernel is poisoned
+rather than reused; migration of all trusted computation to disposable processes
+is incomplete. Model-generated custom variables are not persisted across workers.
+
+`pipeline/model_builder/supervised.py` is the shared supervised training service.
+The final held-out evaluation model is separate from the all-labelled-row refit.
+Export packages include preprocessing, raw named input schema and dependencies.
+The review document records boundaries for legacy paths and multi-user deployment.

@@ -76,6 +76,18 @@ class SessionKernel:
     def __init__(self) -> None:
         self.namespace: dict[str, Any] = {"__builtins__": __builtins__}
         self._exec_count = 0
+        self.pending_changes: list[dict] = []
+        self.task_intent: Any = None
+        self.remaining_tool_calls = 24
+        self.turn_deadline = float("inf")
+        self.task_instruction = ""
+        # Names of DataFrames/Series the sandbox carried forward between steps.
+        # Kept as an attribute, outside the namespace generated code can read.
+        self.sandbox_state: set[str] = set()
+        # Successful execute_code cells in order (code, output, finding), from
+        # which the session's analysis is exported as a notebook or script.
+        self.analysis_cells: list[dict] = []
+        self._poisoned = False
         self._boot()
 
     # ── pre-load common DS imports ─────────────────────────────────────
@@ -107,6 +119,7 @@ class SessionKernel:
         result = load(data_path)
         if result.error and result.df is None:
             return f"Load error: {result.error}"
+        self.invalidate_analysis()
         # Inject all namespace variables produced by the loader.
         self.namespace.update(result.namespace)
         self.namespace["data"] = result.raw
@@ -116,6 +129,21 @@ class SessionKernel:
         if self.namespace.get("df") is None and result.df is not None:
             self.namespace["df"] = result.df
         return describe_load_result(result)
+
+    def invalidate_analysis(self) -> None:
+        """Invalidate derived results whenever inputs or task instructions change."""
+        for key in ("TASK_SPEC", "df_eng", "best_model", "model", "ML_PLAN",
+                    "DATA_ANALYSIS_REPORT", "EDA_REPORT", "TRAINING_RESULT",
+                    "LEAKAGE_COLS", "MI_SCORES", "IGR_SCORES", "WORK_PLAN",
+                    "TOOLS_RUN", "EXPLORATION_LOG", "TARGET", "EDA_AGENDA"):
+            self.namespace.pop(key, None)
+        # Tables the sandbox carried forward between analysis steps were
+        # computed from the previous inputs, so they are stale now too.
+        for key in getattr(self, "sandbox_state", set()):
+            self.namespace.pop(key, None)
+        self.sandbox_state = set()
+        self.analysis_cells = []
+        self.namespace["DATA_VERSION"] = __import__("uuid").uuid4().hex
 
     def set_context(self, target: str | None, brief: str) -> None:
         """Inject session metadata into the kernel namespace."""
@@ -128,8 +156,17 @@ class SessionKernel:
         exec(compile(code, "<kernel>", "exec"), self.namespace)  # noqa: S102
 
     def execute(self, code: str,
-                timeout_s: int | None = None) -> CellOutput:
+                timeout_s: int | None = None,
+                *, confine_to_workdir: bool = False) -> CellOutput:
         """Run `code` in the persistent namespace; capture all output.
+
+        `confine_to_workdir=True` runs the code with the process working
+        directory temporarily set to WORK_DIR, so a relative write like
+        `df.to_csv("out.csv")` lands in the user's working directory instead of
+        wherever the server was launched (the repo root). Untrusted, LLM-written
+        code (execute_code) passes this; trusted internal callers do not. The
+        chdir is done under the existing exec lock and restored afterwards, so
+        it does not race other kernel executions.
 
         Runs the exec in a watchdog thread. If it exceeds `timeout_s`
         (default DSAGENT_EXEC_TIMEOUT_S = 120), a KeyboardInterrupt is
@@ -139,6 +176,8 @@ class SessionKernel:
         still leak the worker thread but the caller gets a timeout
         result instead of hanging forever.
         """
+        if self._poisoned:
+            return CellOutput(success=False, error="Kernel disabled after an uninterruptible timeout; create a new session.")
         self._exec_count += 1
         deadline = timeout_s if timeout_s is not None else DEFAULT_EXEC_TIMEOUT_S
 
@@ -156,6 +195,17 @@ class SessionKernel:
                 _plt.close("all")
             except Exception:
                 pass
+
+            # Confine relative file writes to the working directory.
+            _prev_cwd: str | None = None
+            if confine_to_workdir:
+                _wd = self.namespace.get("WORK_DIR")
+                if _wd:
+                    try:
+                        _prev_cwd = os.getcwd()
+                        os.chdir(str(_wd))
+                    except Exception:
+                        _prev_cwd = None
 
             def _work() -> None:
                 try:
@@ -184,6 +234,7 @@ class SessionKernel:
                     _async_raise(worker.ident, KeyboardInterrupt)
                     worker.join(5.0)  # grace period for the except branch
                     if worker.is_alive():
+                        self._poisoned = True
                         # Uninterruptible (blocking C call). Report and move on;
                         # the daemon thread is leaked but the caller is free.
                         out.error = (
@@ -197,6 +248,11 @@ class SessionKernel:
                 out.stderr = sys.stderr.getvalue()
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
+                if _prev_cwd is not None:
+                    try:
+                        os.chdir(_prev_cwd)
+                    except Exception:
+                        pass
 
             # Harvest matplotlib figures.
             try:

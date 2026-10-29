@@ -15,7 +15,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import chromadb
 import httpx
@@ -173,15 +173,18 @@ class LongTermMemory:
         except Exception:
             return []
 
-        if not results.get("documents"):
+        documents = results.get("documents")
+        metadatas = results.get("metadatas")
+        distances = results.get("distances")
+        if not documents or not metadatas or not distances:
             return []
 
         return [
             {"content": doc, "metadata": meta, "distance": dist}
             for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
+                documents[0],
+                metadatas[0],
+                distances[0],
             )
         ]
 
@@ -220,7 +223,7 @@ class LongTermMemory:
 
     def delete_session_memories(self, session_id: str) -> None:
         try:
-            self._col.delete(where={"session_id": {"$eq": session_id}})
+            self._col.delete(where=cast(Any, {"session_id": {"$eq": session_id}}))
         except Exception:
             pass
 
@@ -229,6 +232,6 @@ class LongTermMemory:
         from datetime import timedelta
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
         try:
-            self._col.delete(where={"ts": {"$lt": cutoff}})
+            self._col.delete(where=cast(Any, {"ts": {"$lt": cutoff}}))
         except Exception:
             pass

@@ -8,13 +8,23 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - "dvc.lock"
+      - "dvc.yaml"
+      - "configs/**"
+      - "docker/**"
+      - ".github/workflows/**"
+      - ".dvc/config"
 
 jobs:
   fast-ci:
     runs-on: ubuntu-latest
+    env:
+      DSAGENT_STATE_DIR: /tmp/ds-agent-ci
+      DVC_SITE_CACHE_DIR: /tmp/ds-agent-dvc-cache
+      DVC_NO_ANALYTICS: "1"
+      OMP_NUM_THREADS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install dependencies
@@ -23,8 +33,10 @@ jobs:
         run: ruff check .
       - name: Type check
         run: mypy agent/ --ignore-missing-imports
-      - name: Unit tests
-        run: pytest tests/unit/ -x --cov=agent --cov-fail-under=80
+      - name: Unit and integration tests
+        run: pytest tests/ -x --cov=agent --cov-fail-under=80
+      - name: Reproduce demonstration pipeline
+        run: dvc repro
       - name: DVC dry run
         run: dvc repro --dry
       - name: Schema validation

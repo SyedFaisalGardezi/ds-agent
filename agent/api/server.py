@@ -21,12 +21,14 @@ metrics, feature-names, and run identifiers.
 from __future__ import annotations
 
 import math
+import os
 import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -48,6 +50,12 @@ from agent.tools.pii_detector import PIIDetectorTool
 from agent.tools.plot_tool import PlotTool
 from agent.tools.powerbi_exporter import PowerBIExporterTool
 from agent.tools.report_generator import ReportGeneratorTool
+
+# Load .env into the process environment so DSAGENT_LLM_BACKEND, the Anthropic
+# key, and the other settings take effect on `uvicorn agent.api.server:app`
+# without the user having to export them by hand. Existing shell exports win
+# (override=False), and this runs before create_app() builds the LLM client.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 _TOOLS: dict[str, Any] = {
     "cost_estimator": CostEstimatorTool,
@@ -163,6 +171,27 @@ def _df(records: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def _use_claude() -> bool:
+    """Pick the LLM backend from a single toggle.
+
+    USE_CLAUDE (yes/no/true/false/1/0/on/off) is the switch. When it is not set,
+    fall back to the legacy DSAGENT_LLM_BACKEND=anthropic for compatibility.
+    """
+    raw = os.environ.get("USE_CLAUDE")
+    if raw is not None:
+        return raw.strip().lower() in ("yes", "y", "true", "1", "on", "claude")
+    return os.environ.get("DSAGENT_LLM_BACKEND", "ollama").lower() == "anthropic"
+
+
+def make_llm_client():
+    """The LLM client the USE_CLAUDE toggle selects (shared by the server and
+    the evaluation harness, so both run the same backend)."""
+    from agent.api import trace
+    from agent.api.llm import AnthropicClient, OllamaClient
+    llm = AnthropicClient() if _use_claude() else OllamaClient()
+    return trace.install(llm)   # records calls only when DSAGENT_TRACE_DIR is set
+
+
 # ---- app factory ------------------------------------------------------- #
 
 
@@ -173,14 +202,18 @@ def create_app(leaderboard_db: Path | str | None = None) -> FastAPI:
 
     from agent.api.chat import make_router as make_chat_router
     from agent.api.jobs import JobRunner
-    from agent.api.llm import OllamaClient
     from agent.api.sessions import SessionStore
 
     app = FastAPI(title="ds-agent", version="0.1.0")
     lb = Leaderboard(db_path=leaderboard_db)
     store = SessionStore()
     jobs = JobRunner(max_workers=2)
-    llm = OllamaClient()
+    # One toggle picks the backend: USE_CLAUDE=yes runs the Claude API (needs
+    # ANTHROPIC_API_KEY and console credits, billed separately from a claude.ai
+    # subscription); anything else runs local Ollama. The key can stay in .env
+    # unused when the toggle is off, so nothing needs commenting out.
+    llm = make_llm_client()
+
 
     # Memory singletons — graceful init; None means silently disabled
     ltm = None
@@ -199,6 +232,43 @@ def create_app(leaderboard_db: Path | str | None = None) -> FastAPI:
     app.include_router(make_chat_router(store=store, leaderboard=lb,
                                         jobs=jobs, llm=llm,
                                         ltm=ltm, schema_cache=schema_cache))
+
+    # Multi-user auth. The router is always available; the gate below requires a
+    # valid token only when DSAGENT_AUTH_ENABLED=1, so tests and single-user use
+    # are unaffected.
+    from agent.api.auth import auth_enabled, make_auth_router, verify_token
+    if auth_enabled():
+        from agent.api.auth import _secret, smtp_configured
+        _secret()
+        if not smtp_configured():
+            raise RuntimeError("Authentication requires configured SMTP delivery")
+    app.include_router(make_auth_router())
+
+    _public_paths = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+    _public_prefixes = ("/auth", "/static")
+
+    @app.middleware("http")
+    async def _auth_gate(request, call_next):  # noqa: ANN001, ANN202
+        if not auth_enabled():
+            return await call_next(request)
+        path = request.url.path
+        if path in _public_paths or any(path.startswith(p)
+                                        for p in _public_prefixes):
+            return await call_next(request)
+        authz = request.headers.get("Authorization", "")
+        token = authz[7:] if authz.startswith("Bearer ") else None
+        if not token:
+            token = request.cookies.get("ds_token")
+        email = verify_token(token)
+        if not email:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+        if path.startswith(("/pipelines", "/tools", "/leaderboard")):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "Use owner-scoped chat endpoints in multi-user mode"}, status_code=403)
+        request.state.user_email = email
+        return await call_next(request)
+
     app.state.session_store = store
     app.state.jobs = jobs
     app.state.llm = llm

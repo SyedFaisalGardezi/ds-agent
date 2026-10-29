@@ -7,6 +7,19 @@ from pathlib import Path
 
 _DB_PATH = Path("outputs/datasets/provenance.db")
 
+
+def track_run(folder: Path) -> None:
+    """Track internal run inputs, model and manifest in a standalone DVC store."""
+    import os
+    import subprocess
+    import sys
+    env = dict(os.environ, DVC_SITE_CACHE_DIR=str(folder / ".dvc-site-cache"),
+               DVC_NO_ANALYTICS="1")
+    for args in (["init", "--no-scm"], ["add", "dataset.parquet", "model.joblib", "manifest.json"]):
+        subprocess.run([sys.executable, "-m", "dvc", *args], cwd=folder, env=env,
+                       check=True, capture_output=True, text=True, timeout=60)
+
+
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS provenance (
     run_id        TEXT,

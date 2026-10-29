@@ -22,12 +22,18 @@ from agent.core.types import ToolResult
 # anchors the tail, and a trailing \b would fail after "(" because both "(" and
 # a following "'" are non-word characters.
 _FORBIDDEN_PATTERNS = re.compile(
-    r"\b(?:"
+    r"(?:\b(?:"
     r"os\.system|os\.popen|os\.exec[lv]|os\.fork|os\.kill|"
-    r"subprocess\.|shutil\.rmtree|socket\.(?:socket|create_connection)|"
+    r"subprocess\.|shutil\.rmtree|shutil\.move|socket\.(?:socket|create_connection)|"
+    # Deleting is never the agent's call to make on its own. Blocked here so
+    # execute_code cannot route around the approval queue the file tools use.
+    r"os\.remove|os\.unlink|os\.rmdir|os\.removedirs|"
     r"__import__\s*\(|compile\s*\(|eval\s*\(|exec\s*\(|"
     r"ctypes\.|multiprocessing\.|threading\.Thread"
     r")"
+    # Method-call forms sit outside the \b group: in Path(p).unlink() the dot
+    # follows ")", and two non-word characters give no word boundary to match.
+    r"|\.unlink\s*\(|\.rmdir\s*\()"
 )
 
 _DEFAULT_TIMEOUT_S = 30

@@ -1,6 +1,8 @@
 """FastAPI surface tests — hit every endpoint and assert envelope shape."""
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -197,6 +199,158 @@ def test_chat_workdir_sets_path(client, tmp_path):
     assert str(tmp_path) in str(r2.json())
 
 
+def test_chat_workdir_missing_path_is_not_created(client, tmp_path):
+    """A path that does not exist is a typo, not a request to make a directory.
+
+    Creating it silently gave the session an empty workspace that looked like it
+    had worked, and the agent then spent its step budget on invented filenames.
+    """
+    r = client.post("/chat/sessions")
+    sid = r.json()["session_id"]
+    missing = tmp_path / "nope"
+
+    r2 = client.post(f"/chat/sessions/{sid}/workdir", json={"path": str(missing)})
+    assert r2.status_code == 400
+    assert not missing.exists()
+
+
+def test_chat_workdir_suggests_near_miss_sibling(client, tmp_path):
+    """A path copied out of a sentence keeps the full stop that ended it."""
+    real = tmp_path / "WorkForce_DS"
+    real.mkdir()
+
+    r = client.post("/chat/sessions")
+    sid = r.json()["session_id"]
+    r2 = client.post(f"/chat/sessions/{sid}/workdir",
+                     json={"path": str(tmp_path / "WorkForce_DS.")})
+    assert r2.status_code == 400
+    assert str(real) in r2.json()["detail"]
+
+
+def test_ui_and_server_agree_that_multiagent_is_off():
+    """The checkbox and the server default must not drift apart.
+
+    Nothing else reads this file, and a UI that ships `checked` while the server
+    defaults to off means the toggle silently wins on every message. The storage
+    key is versioned for the same reason: anyone carrying the old value would
+    otherwise keep the orchestrator and the new default would look unapplied.
+    """
+    from pathlib import Path
+
+    from agent.api.agent_runner import _MULTIAGENT
+
+    assert _MULTIAGENT is False
+    html = (Path(__file__).resolve().parents[2]
+            / "agent" / "api" / "static" / "index.html").read_text()
+    checkbox = next(ln for ln in html.splitlines() if 'id="ma-checkbox"' in ln)
+    assert "checked" not in checkbox, checkbox
+    # Every localStorage call for this toggle must use the versioned key. A
+    # bare mention in a comment is fine; a call is not.
+    calls = [ln.strip() for ln in html.splitlines()
+             if "localStorage" in ln and "ds_multiagent" in ln]
+    assert calls, "toggle no longer persists at all"
+    assert all("ds_multiagent_v2" in ln for ln in calls), calls
+
+
+def test_page_waits_for_long_runs_instead_of_rendering_empty():
+    """A 16-minute analysis must still reach the page when it finishes."""
+    import re
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[2]
+            / "agent" / "api" / "static" / "index.html").read_text()
+    render = html[html.index("async function pollAndRender"):]
+    render = render[:render.index("\n}\n")]
+    assert "waitForJob(" in render
+    assert not re.search(r"attempt\s*<\s*\d+", render)   # no fixed poll budget
+    chat_src = (Path(__file__).resolve().parents[2] / "agent" / "api" / "chat.py").read_text()
+    assert "deadline = DEFAULT_JOB_TIMEOUT_S +" in chat_src
+
+
+def test_failed_run_reports_instead_of_vanishing(client, monkeypatch):
+    """A crash in the run must reach the user, in the log and the conversation.
+
+    The worker used to be try/finally with no except: the finally closed the
+    progress stream, so the UI printed "Done" and moved on, while the turn ended
+    with the user's message and no answer at all. Nothing said anything had gone
+    wrong.
+    """
+    from agent.api import agent_runner, progress
+
+    def _boom(*a, **kw):
+        raise RuntimeError("kernel exploded")
+
+    emitted: list[tuple[str, str]] = []
+    real_emit = progress.emit
+
+    def _spy(job_id, message, *, tool="", level="info"):
+        emitted.append((message, level))
+        real_emit(job_id, message, tool=tool, level=level)
+
+    monkeypatch.setattr(agent_runner, "run_reactive", _boom)
+    monkeypatch.setattr(client.app.state.llm, "is_available", lambda: True)
+    monkeypatch.setattr(progress, "emit", _spy)
+
+    sid = client.post("/chat/sessions").json()["session_id"]
+    posted = client.post(f"/chat/sessions/{sid}/message", json={"text": "do it"})
+    assert posted.status_code == 200
+    jid = posted.json()["job_id"]
+
+    # The job is still marked failed, carrying the real error.
+    for _ in range(50):
+        job = client.get(f"/chat/sessions/{sid}/jobs/{jid}").json()
+        if job.get("state") in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    assert job["state"] == "failed"
+    assert "kernel exploded" in (job.get("error") or "")
+
+    # The conversation records the failure rather than ending on the question.
+    msgs = client.get(f"/chat/sessions/{sid}").json()["messages"]
+    assert msgs and msgs[-1]["role"] == "assistant"
+
+    # And the failure was announced on the progress stream before it closed.
+    # close() removes the queue, so a live SSE client sees the event but the
+    # test cannot drain it afterwards; capture the emit itself instead.
+    assert any(lvl == "error" and "kernel exploded" in msg
+               for msg, lvl in emitted)
+
+
+def test_pending_endpoints_are_wired(client, monkeypatch):
+    """The three pending-change routes reach the queue functions.
+
+    The staging and applying behaviour itself is covered against a real kernel
+    in test_agent_runner_helpers; this checks the HTTP surface around it.
+    """
+    from agent.api import agent_tools as at
+
+    seen: dict[str, object] = {}
+
+    def _fake_apply(kernel, ids, session=None):
+        seen["apply"] = ids
+        return {"applied": [], "failed": [], "pending": 0}
+
+    def _fake_discard(kernel, ids):
+        seen["discard"] = ids
+        return {"discarded": 1, "pending": 0}
+
+    monkeypatch.setattr(at, "pending_changes",
+                        lambda k: [{"id": "chg_1", "summary": "create a.txt"}])
+    monkeypatch.setattr(at, "apply_pending", _fake_apply)
+    monkeypatch.setattr(at, "discard_pending", _fake_discard)
+
+    sid = client.post("/chat/sessions").json()["session_id"]
+
+    listed = client.get(f"/chat/sessions/{sid}/pending")
+    assert listed.status_code == 200
+    assert listed.json()["pending"][0]["id"] == "chg_1"
+
+    r = client.post(f"/chat/sessions/{sid}/pending/apply", json={"ids": ["chg_1"]})
+    assert r.status_code == 200 and seen["apply"] == ["chg_1"]
+
+    r = client.post(f"/chat/sessions/{sid}/pending/discard", json={})
+    assert r.status_code == 200 and seen["discard"] is None
+
+
 def test_chat_workdir_with_csv_autoscan(client, tmp_path):
     """Setting a workdir with a CSV in it auto-loads it as df."""
     import pandas as pd
@@ -213,9 +367,25 @@ def test_chat_workdir_with_csv_autoscan(client, tmp_path):
     assert "data.csv" in body["loaded_data"][0]
 
 
+def test_chat_workdir_does_not_load_agent_plan_as_instructions(client, tmp_path):
+    """A plan the agent saved earlier is its own output, not the user's brief."""
+    (tmp_path / "brief.md").write_text("Find unusual providers.")
+    (tmp_path / "analysis_plan.md").write_text(
+        "# Analysis plan\n\n_First pass, written before EDA. The feature and model "
+        "choices are assumptions to be tested._\n\nTarget: `service_date`\n")
+    sid = client.post("/chat/sessions").json()["session_id"]
+    body = client.post(f"/chat/sessions/{sid}/workdir",
+                       json={"path": str(tmp_path), "create": False}).json()
+    assert body["loaded_briefs"] == ["`brief.md`"]
+    session = client.get(f"/chat/sessions/{sid}").json()
+    assert "analysis_plan.md" not in session["brief_filenames"]
+    assert "plans the agent wrote earlier" in session["messages"][-1]["text"]
+
+
 def test_chat_upload_secondary_loads_as_df2(client, tmp_path):
     """Uploading two CSV files makes the second available as df2."""
     import io
+
     import pandas as pd
 
     r = client.post("/chat/sessions")
@@ -250,3 +420,41 @@ def test_chat_brief_upload_clears_task_spec(client, tmp_path):
     )
     assert r2.status_code == 200
     assert r2.json()["brief_chars"] > 0
+
+
+# ── backend toggle (_use_claude) ─────────────────────────────────────────────
+
+def test_use_claude_toggle(monkeypatch):
+    from agent.api.server import _use_claude
+    for v in ("yes", "Yes", "true", "1", "on", "claude"):
+        monkeypatch.setenv("USE_CLAUDE", v)
+        assert _use_claude() is True, v
+    for v in ("no", "No", "false", "0", "off", ""):
+        monkeypatch.setenv("USE_CLAUDE", v)
+        assert _use_claude() is False, v
+
+
+def test_use_claude_legacy_fallback(monkeypatch):
+    """With USE_CLAUDE unset, the old DSAGENT_LLM_BACKEND still works."""
+    from agent.api.server import _use_claude
+    monkeypatch.delenv("USE_CLAUDE", raising=False)
+    monkeypatch.setenv("DSAGENT_LLM_BACKEND", "anthropic")
+    assert _use_claude() is True
+    monkeypatch.setenv("DSAGENT_LLM_BACKEND", "ollama")
+    assert _use_claude() is False
+    monkeypatch.delenv("DSAGENT_LLM_BACKEND", raising=False)
+    assert _use_claude() is False  # default: local Ollama
+
+
+def test_use_claude_toggle_actually_selects_the_backend(monkeypatch):
+    """The toggle function once survived while the line using it was lost, so
+    USE_CLAUDE=yes silently ran the local model. Test the wiring, not just the
+    parser."""
+    from agent.api.llm import AnthropicClient, OllamaClient
+    from agent.api.server import create_app, make_llm_client
+    monkeypatch.setenv("USE_CLAUDE", "yes")
+    assert isinstance(make_llm_client(), AnthropicClient)
+    assert isinstance(create_app().state.llm, AnthropicClient)
+    monkeypatch.setenv("USE_CLAUDE", "no")
+    client = make_llm_client()
+    assert isinstance(client, OllamaClient) and not isinstance(client, AnthropicClient)

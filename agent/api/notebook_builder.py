@@ -243,10 +243,10 @@ def build(
             top_mi = sorted(mi_scores.items(), key=lambda x: -float(x[1] or 0))[:15]
             mi_rows = "\n".join(f"  - `{k}` — MI {float(v):.4f}" for k, v in top_mi)
         elif isinstance(mi_scores, list):
-            top_mi = sorted(mi_scores, key=lambda x: -float(x.get("mi", 0)))[:15]
+            top_mi_records = sorted(mi_scores, key=lambda x: -float(x.get("mi", 0)))[:15]
             mi_rows = "\n".join(
                 f"  - `{s.get('feature','?')}` — MI {float(s.get('mi',0)):.4f}"
-                for s in top_mi
+                for s in top_mi_records
             )
         else:
             mi_rows = ""

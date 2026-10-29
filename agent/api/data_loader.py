@@ -151,9 +151,7 @@ def _load_tabular(path: Path, ext: str) -> LoadResult:
                 return _load_scientific(path, ext)
 
         elif ext in (".pkl", ".pickle"):
-            raw = pd.read_pickle(path)
-            df = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
-            fmt = "pickle"
+            raise ValueError("Pickle uploads are executable and are not accepted; use Parquet or CSV.")
 
         elif ext == ".dta":
             df = pd.read_stata(path)
@@ -233,7 +231,7 @@ def _load_scientific(path: Path, ext: str) -> LoadResult:
 
     if ext in (".npy", ".npz"):
         libs.append("numpy")
-        raw = np.load(str(path), allow_pickle=True)
+        raw = np.load(str(path), allow_pickle=False)
         if ext == ".npz":
             keys = list(raw.keys())
             # Use first 2-D array as df if possible
@@ -420,7 +418,7 @@ def _load_pdf_as_text(path: Path) -> LoadResult:
             pages.append({"page": i + 1, "text": text,
                           "n_chars": len(text), "n_words": len(text.split())})
         df = pd.DataFrame(pages)
-        full_text = "\n\n".join(p["text"] for p in pages)
+        full_text = "\n\n".join(str(p["text"]) for p in pages)
         summary = (
             f"Loaded **PDF** `{path.name}`.\n"
             f"{len(pages)} pages, {df['n_chars'].sum():,} chars total."

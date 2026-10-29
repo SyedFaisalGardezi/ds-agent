@@ -38,6 +38,7 @@ class ChatMessage:
 @dataclass
 class Session:
     session_id: str
+    owner_id: str | None = None
     created_at: float = field(default_factory=time.time)
     messages: list[ChatMessage] = field(default_factory=list)
     # Primary data file (first uploaded); kept for backward compat.
@@ -125,6 +126,8 @@ class SessionStore:
             if not row:
                 continue
             s = Session(session_id=sid)
+            s.owner_id = row.get("owner_id")
+            s.work_dir = Path(row["work_dir"]) if row.get("work_dir") else None
             s.target = row.get("target")
             s.brief = row.get("brief") or ""
             import json as _json
@@ -162,17 +165,24 @@ class SessionStore:
         except Exception:
             pass
 
-    def create(self) -> Session:
+    def create(self, owner_id: str | None = None) -> Session:
         sid = uuid.uuid4().hex[:12]
         with self._lock:
-            self._sessions[sid] = Session(session_id=sid)
+            self._sessions[sid] = Session(session_id=sid, owner_id=owner_id, isolation_mode=owner_id is not None)
             s = self._sessions[sid]
         if self._db is not None:
             try:
                 self._db.create_session(sid)
+                self._db.save_session(s)
             except Exception:
                 pass
         return s
+
+    def delete(self, sid: str) -> None:
+        with self._lock:
+            self._sessions.pop(sid, None)
+        if self._db is not None:
+            self._db.delete_session(sid)
 
     def get(self, sid: str) -> Session | None:
         with self._lock:

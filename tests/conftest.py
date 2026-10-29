@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
+import os
+import tempfile
 
-from agent.connectors.base import DataConnector
-from agent.core.types import ToolResult
+# Keep test sessions out of the user's real session store (~/.ds-agent). The
+# store reads this at import time, so it must be set before any agent import.
+os.environ["DSAGENT_STATE_DIR"] = tempfile.mkdtemp(prefix="ds-agent-tests-")
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+
+from agent.connectors.base import DataConnector  # noqa: E402
+from agent.core.types import ToolResult  # noqa: E402
 
 
 @pytest.fixture(scope="session")

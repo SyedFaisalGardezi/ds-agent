@@ -21,13 +21,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.api.agent_tools import TOOL_REGISTRY, ToolOutput
+from agent.api.agent_tools import TOOL_REGISTRY, ToolOutput, work_plan_is_stale
 from agent.api.kernel import SessionKernel
 from agent.api.sessions import Session
 
 # Memory imports — all optional; fall back gracefully if unavailable
 try:
-    from agent.memory.isolation import apply_isolation_intent as _apply_isolation
     from agent.memory.session_memory import build_context_messages
     _MEMORY_OK = True
 except Exception:
@@ -49,12 +48,121 @@ _CRITIC_ENABLED = os.environ.get("DSAGENT_CRITIC", "1") != "0"
 _MAX_RETRIES_PER_STEP = int(os.environ.get("DSAGENT_MAX_RETRIES", "2"))
 _MAX_LOOP_REPLANS = int(os.environ.get("DSAGENT_MAX_REPLANS", "2"))
 
+# The critic costs a full LLM call per tool result, which on a local model is as
+# expensive as the step it is judging. Retrieval tools either return the bytes
+# asked for or an error, and the error path is caught by the rule-based check
+# without an LLM call, so a successful one has nothing for the critic to weigh.
+# Judge the tools whose output should actually change the plan: what the data
+# looks like, how good it is, and how a model scored.
+_CRITIC_SKIP_TOOLS = frozenset({
+    "explore_directory", "read_file", "search_files", "read_instructions",
+    "write_file", "edit_file", "build_notebook", "scaffold_cicd", "visualize",
+})
+# Set DSAGENT_CRITIC_ALL=1 to critique every tool result (slower, more thorough).
+_CRITIC_ALL_TOOLS = os.environ.get("DSAGENT_CRITIC_ALL", "0") == "1"
+
 # Multi-agent orchestration: a supervisor dispatches sub-goals to role-specialised
-# agents (each a focused system prompt + tool subset), instead of one agent
-# holding all tools. Set DSAGENT_MULTIAGENT=0 for the single-agent loop.
-_MULTIAGENT = os.environ.get("DSAGENT_MULTIAGENT", "1") != "0"
+# agents. OFF by default. A data-science pipeline is a dependency chain —
+# discover, understand, profile, plan, engineer, train — and that is the shape
+# multi-agent handles worst: Anthropic report it suits "breadth-first queries
+# pursuing multiple independent directions" and that "domains that require all
+# agents to share the same context or involve many dependencies between agents
+# are not a good fit". Measured here, the handoffs lose most of what they carry
+# (see _run_multiagent_loop). Set DSAGENT_MULTIAGENT=1 to use it anyway.
+_MULTIAGENT = os.environ.get("DSAGENT_MULTIAGENT", "0") != "0"
 _MAX_ORCH_ROUNDS = int(os.environ.get("DSAGENT_MAX_ORCH_ROUNDS", "6"))
+
+# Step budget for the agentic loop. This used to share `max_tool_calls` with the
+# deterministic keyword plan, which left the single agent 12 steps while the
+# multi-agent path took 6 rounds x 6 specialist steps = 36 and ignored the
+# argument entirely. Those are different jobs, so they get different numbers.
+_AGENT_MAX_STEPS = int(os.environ.get("DSAGENT_AGENT_STEPS", "24"))
 _SPECIALIST_MAX_STEPS = int(os.environ.get("DSAGENT_SPECIALIST_STEPS", "6"))
+
+# Sentinel returned by _classify_tools for open-ended exploration/analysis. It
+# is not a real tool: run_reactive intercepts it and hands the turn to the
+# adaptive tool loop so the LLM designs the analysis and reasons about each
+# result, instead of executing a fixed keyword-chosen sequence.
+_ADAPTIVE_SENTINEL = "__adaptive__"
+
+# Output budget for one tool-calling turn. This has to hold the whole tool call,
+# and when the agent writes a document the document IS an argument, so a small
+# budget truncates the JSON mid-string. A truncated call does not parse, and
+# _coerce_tool_args then yields {}, which surfaces as "needs a 'path'" rather
+# than as "too long". 3000 tokens is roughly 2200 words of file content and
+# still leaves room inside num_ctx=8192 beside the prompt and tool schemas.
+# Raise DSAGENT_NUM_CTX too before raising this much further.
+_TOOL_TURN_TOKENS = int(os.environ.get("DSAGENT_TOOL_TURN_TOKENS", "4000"))
+
+# A reasoning model spends output tokens thinking before it answers, and the
+# budget has to cover both or the reply is cut off before the JSON appears.
+# Measured with gpt-oss:20b on this project's prompts: the router thinks ~590
+# characters, the critic ~800. These were 60 and 280, which returned nothing.
+_ROUTER_TOKENS = int(os.environ.get("DSAGENT_ROUTER_TOKENS", "500"))
+_CRITIC_TOKENS = int(os.environ.get("DSAGENT_CRITIC_TOKENS", "900"))
+
+# How much of a tool result the model gets to read. The newest result keeps the
+# full budget because that is what the next decision rests on; older ones are
+# trimmed to a gist so the conversation cannot outgrow num_ctx.
+_OBS_CHARS = int(os.environ.get("DSAGENT_OBS_CHARS", "4000"))
+_OBS_TAIL_CHARS = int(os.environ.get("DSAGENT_OBS_TAIL_CHARS", "700"))
+
+# Show the model the plots it produces, so a distribution or a correlation
+# heatmap is read rather than guessed at from summary statistics. OFF by
+# default because the default model (gpt-oss:20b) has no vision, and a model
+# that ignores images rather than rejecting them would silently burn tokens on
+# every figure. Set DSAGENT_SEND_FIGURES=1 when running a vision model; it was
+# verified working on qwen3.8:27b-mlx, which read a histogram correctly.
+# Only the newest step's figures are attached, and only a couple of them.
+_SEND_FIGURES = os.environ.get("DSAGENT_SEND_FIGURES", "0") != "0"
+_MAX_FIGURES_SENT = int(os.environ.get("DSAGENT_MAX_FIGURES_SENT", "2"))
+# Cap on the encoded size of an attached figure. The kernel saves at dpi=100,
+# where a multi-panel EDA grid runs to about 48 KB, and on a 27B local model a
+# 7 KB image already added around 90 s to a turn.
+_MAX_FIGURE_CHARS = int(os.environ.get("DSAGENT_MAX_FIGURE_CHARS", "20000"))
+
+
+def _shrink_figure(b64: str, max_chars: int = _MAX_FIGURE_CHARS) -> str | None:
+    """Compress an encoded PNG to fit the budget, keeping it readable.
+
+    Charts compress by colour count, not by pixel count. A plot is flat areas
+    and a few line colours, which PNG stores cheaply; resampling it smaller
+    anti-aliases every crisp edge into a gradient and makes the file BIGGER.
+    Measured on a 12-panel histogram grid: 48,112 chars original, 18,140 after
+    quantising at full resolution, but 28,512 after resizing to 75% and
+    quantising. So quantise first and only resize if that is not enough, since
+    resolution is what keeps axis labels legible.
+
+    Returns None when it cannot be brought under the cap, so the caller skips
+    the picture rather than spending minutes on it. Best-effort: Pillow ships
+    with matplotlib, but a missing decoder only costs the image.
+    """
+    if len(b64) <= max_chars:
+        return b64
+    try:
+        import base64 as _b64
+        import io as _io
+
+        from PIL import Image
+        img = Image.open(_io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+
+        def _encode(im, colors: int) -> str:
+            buf = _io.BytesIO()
+            im.quantize(colors=colors, method=Image.Quantize.MEDIANCUT).save(
+                buf, format="PNG", optimize=True)
+            return _b64.b64encode(buf.getvalue()).decode()
+
+        for scale, colors in ((1.0, 64), (1.0, 32), (1.0, 16),
+                              (0.7, 32), (0.5, 32), (0.5, 16)):
+            im = img if scale == 1.0 else img.resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                Image.Resampling.LANCZOS)
+            out = _encode(im, colors)
+            if len(out) <= max_chars:
+                return out
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 # ── compact tool list shown to planner (much shorter than full MCP JSON) ──────
 
@@ -202,6 +310,31 @@ RULES:
    you cannot see previous results.
 7. When every requirement is addressed and you have enough information, stop
    calling tools and write the final answer as plain text for the user.
+8. For exploration, do not run a fixed checklist. If the session state names a
+   task or focus (from a brief), let it set the depth and the kind of EDA and
+   target the questions it raises; with no task known, do a broad general
+   exploration of the whole dataset. Profile first, then READ that result and
+   let it choose the next analysis. Go past per-column histograms to
+   the relationships that explain the data: group-level aggregates, ratios
+   between columns, per-entity comparisons against the peer median, and
+   concentration between entities. Each plot or table must answer a specific
+   question the previous step raised; if it does not, do not produce it. Use
+   execute_code for any relationship the standard tools do not cover.
+9. Never state a statistic, describe a plot, or say a file was saved unless a
+   tool in THIS turn actually produced it. If you did not run it, do not claim
+   it. When something could not run, say so plainly instead of inventing a
+   result. A made-up number is worse than a missing one.
+10. You cannot see charts; only printed text reaches you. Base every finding
+   on printed numbers, and never say what a plot "shows" or "confirms". A file
+   written in this turn is a proposal awaiting the user's approval, not saved.
+11. When the session state shows an EDA AGENDA, it is your work list. Take the
+   OPEN items in order of importance to the brief, and make each step settle
+   one of them or a lead a result raised; use the ANSWERED findings to choose
+   what to look at next. Stop exploring when no open item can be advanced.
+   Do not start feature engineering or modelling unless the request asks for it.
+12. The user sees the work plan separately, so do not restate it. Organise the
+   final answer around the brief's questions (REQUIREMENTS TO SATISFY): answer
+   each one with the numbers found, and say plainly which remain open.
 """
 
 
@@ -243,6 +376,8 @@ def _task_focus(session: Session, kernel: SessionKernel) -> str:
     parts: list[str] = []
     if target:
         parts.append(f"target `{target}`")
+    elif _task_has_no_target(session, kernel):
+        parts.append("no labelled target (unlabelled analysis)")
     if task_type and task_type != "auto":
         parts.append(f"task type {task_type}")
     if metric and metric != "auto":
@@ -253,8 +388,52 @@ def _task_focus(session: Session, kernel: SessionKernel) -> str:
     return focus
 
 
-def _data_context(session: Session, kernel: SessionKernel) -> str:
-    """Compact description of what's loaded in the kernel."""
+def _agenda_block(agenda: list[dict]) -> str:
+    """The EDA agenda as the model sees it: the open items, and what each
+    answered item found, so the next step builds on the results so far
+    instead of repeating or drifting."""
+    open_items = [a for a in agenda if a.get("status") != "answered"]
+    done = [a for a in agenda if a.get("status") == "answered"]
+    out = [f"EDA AGENDA ({len(done)} of {len(agenda)} answered). Each step should "
+           "settle an OPEN item or follow a lead a result raised:"]
+    if open_items:
+        out.append("  OPEN:")
+        out += [f"    [{a['id']}] ({a.get('source', '')}) {a['question'][:200]}"
+                for a in open_items[:14]]
+    if done:
+        out.append("  ANSWERED (build on these):")
+        out += [f"    [{a['id']}] {a['question'][:110]} -> {a.get('finding', '')[:220]}"
+                for a in done[-10:]]
+    return "\n".join(out)
+
+
+# Tools that cannot do anything without a supervised target column.
+_TARGET_ONLY_TOOLS = frozenset({"infer_target", "mutual_information", "train_model"})
+
+
+def _task_has_no_target(session: Session, kernel: SessionKernel) -> bool:
+    """True once the brief has been read and neither it nor the data gave a
+    target, i.e. the task is unlabelled. Offering target-only tools then only
+    sends the agent hunting for a label that does not exist."""
+    spec = kernel.namespace.get("TASK_SPEC")
+    if not isinstance(spec, dict) or not spec:
+        return False
+    return not (spec.get("target_column") or getattr(session, "target", None)
+                or kernel.namespace.get("TARGET"))
+
+
+def _data_context(session: Session, kernel: SessionKernel,
+                  *, compact: bool = False) -> str:
+    """Compact description of what's loaded in the kernel.
+
+    `compact` trims the parts a tool-calling agent does not need in every single
+    turn — chiefly the long verbatim brief, whose actionable content is already
+    carried by the TASK_SPEC and the REQUIREMENTS checklist. It saves roughly a
+    thousand tokens per LLM call, which on a local model is the difference
+    between a prompt that fits the context window and one that gets truncated
+    from the front (taking the system prompt with it). The QA path passes
+    compact=False because answering questions about the brief needs its text.
+    """
     lines: list[str] = []
     # Task focus and the running exploration log make the agent adaptive and
     # task-directed: it explores what serves the stated outcome, and each turn
@@ -262,6 +441,47 @@ def _data_context(session: Session, kernel: SessionKernel) -> str:
     focus = _task_focus(session, kernel)
     if focus:
         lines.append("TASK FOCUS (explore what serves this outcome): " + focus)
+    if _task_has_no_target(session, kernel):
+        lines.append(
+            "NO TARGET: the brief and the data give no labelled outcome column. "
+            "This is unlabelled analysis: do not look for or invent a target.")
+    plan = kernel.namespace.get("WORK_PLAN")
+    agenda = kernel.namespace.get("EDA_AGENDA")
+    if isinstance(plan, dict):
+        _tq = [q for q in (plan.get("eda_questions_task") or [])
+               if isinstance(q, str) and q.strip()]
+        _iq = [q for q in (plan.get("eda_questions_independent") or [])
+               if isinstance(q, str) and q.strip()]
+        lines.append(
+            f"WORK PLAN version {plan.get('version', 1)} is already written"
+            + (f" (objective: {str(plan.get('objective', ''))[:160]})"
+               if plan.get("objective") else "")
+            + ". Do not call work_plan again except with revise=true after the "
+              "agenda is worked through.")
+        if isinstance(agenda, list) and agenda:
+            lines.append(_agenda_block(agenda))
+        elif _tq or _iq:
+            _pl = [f"EDA QUESTIONS FROM THE PLAN (v{plan.get('version', '?')}). "
+                   "Answer these, and say what each answer implies:"]
+            if _tq:
+                _pl.append("  Needed for the brief:")
+                _pl += [f"    - {q[:200]}" for q in _tq[:8]]
+            if _iq:
+                _pl.append("  Independent checks on the data (do these too, "
+                           "they are not optional):")
+                _pl += [f"    - {q[:200]}" for q in _iq[:8]]
+            lines.append("\n".join(_pl))
+        agenda_open = isinstance(agenda, list) and any(
+            a.get("status") != "answered" for a in agenda)
+        # With an agenda, revising is the step AFTER the questions are
+        # answered; shown earlier, the nudge made the model revise after a
+        # single profile with most of the agenda still open.
+        if not plan.get("revised_after_eda") and not agenda_open:
+            lines.append(
+                "The plan has NOT yet been revised against EDA. Once the "
+                "questions above are answered, call work_plan with revise=true "
+                "before any feature engineering or model training.")
+
     log = kernel.namespace.get("EXPLORATION_LOG")
     if isinstance(log, list) and log:
         recent = "\n".join(f"  - {x}" for x in log[-8:])
@@ -274,10 +494,19 @@ def _data_context(session: Session, kernel: SessionKernel) -> str:
         counts = ", ".join(f"{c} {n}" for c, n in (ws.get("counts") or {}).items())
         lines.append(f"WORKING DIRECTORY: {ws['root']}"
                      + (f" ({ws['n_files']} files: {counts})" if counts else ""))
+        if not ws.get("n_files"):
+            # Say it outright. Given only a bare path, the model invents
+            # plausible names (data/, docs/, README.md) and burns the step
+            # budget on reads that cannot succeed.
+            lines.append(
+                "This directory is EMPTY. There are no files to read here, so "
+                "do not guess file names. Tell the user the working directory "
+                "is empty and ask them to check the path.")
         tree = (ws.get("tree") or "").splitlines()
         if tree:
-            shown = "\n".join(tree[:25])
-            more = f"\n  … +{len(tree) - 25} more" if len(tree) > 25 else ""
+            _n = 12 if compact else 25
+            shown = "\n".join(tree[:_n])
+            more = f"\n  … +{len(tree) - _n} more" if len(tree) > _n else ""
             lines.append("Structure:\n" + shown + more)
         for ds in (ws.get("data_schemas") or [])[:5]:
             lines.append(f"  {ds['name']}: {ds['n_cols']} cols — {ds['columns'][:15]}")
@@ -288,6 +517,15 @@ def _data_context(session: Session, kernel: SessionKernel) -> str:
     df = kernel.namespace.get("df")
     if df is not None:
         try:
+            # Say plainly that these are live variables, not a description of
+            # files on disk. Read as metadata, the agent re-loads data that is
+            # already in memory: it wrote pd.read_csv with guessed filenames,
+            # failed, and reported "no data loaded yet" while df sat in the
+            # namespace.
+            lines.append(
+                "DATA ALREADY LOADED IN THE PYTHON KERNEL. These are live "
+                "variables: use them directly in execute_code. Do NOT read the "
+                "CSVs again.")
             lines.append(f"df.shape: {df.shape}")
             lines.append(f"df.columns: {list(df.columns[:30])}")
             null_pct = (df.isna().mean() * 100).round(1)
@@ -342,12 +580,18 @@ def _data_context(session: Session, kernel: SessionKernel) -> str:
     if _brief and _brief.strip():
         _fnames = getattr(session, "brief_filenames", [])
         _label = ", ".join(_fnames) if _fnames else "yes"
-        # Always include a substantial excerpt of the brief text. The concrete
+        # Include a substantial excerpt of the brief text. The concrete
         # instructions are also surfaced separately as the REQUIREMENTS checklist
-        # above, so a long brief does not lose its actionable parts here.
-        _brief_excerpt = _brief[:4000]
-        if len(_brief) > 4000:
-            _brief_excerpt += f"\n... [{len(_brief) - 4000:,} more chars]"
+        # above, so a long brief does not lose its actionable parts here. In
+        # compact mode the checklist carries them and the excerpt shrinks to a
+        # short reminder, because repeating the whole brief on every tool call
+        # is what pushes the prompt past the context window.
+        _budget = 600 if compact else 4000
+        _brief_excerpt = _brief[:_budget]
+        if len(_brief) > _budget:
+            _brief_excerpt += f"\n... [{len(_brief) - _budget:,} more chars"
+            _brief_excerpt += (", call read_instructions for the full text]"
+                               if compact else "]")
         lines.append(
             f"BRIEF ({_label}):\n{_brief_excerpt}"
         )
@@ -372,6 +616,11 @@ def _strip_thinking(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     if "<think>" in cleaned:
         cleaned = cleaned.split("<think>", 1)[0]
+    elif "</think>" in cleaned:
+        # A closing tag with no opener: the model started reasoning straight
+        # away and only marked where it stopped. Everything before the tag is
+        # that reasoning, and without this it is shown to the user as the answer.
+        cleaned = cleaned.split("</think>", 1)[1]
     # Strip Qwen/Llama chat-template tokens that leak into responses
     for tok in _SPECIAL_TOKENS:
         idx = cleaned.find(tok)
@@ -488,7 +737,7 @@ def _parse_plan(raw: str, max_steps: int) -> list[dict]:
         steps = obj
     else:
         return []
-    valid = []
+    valid: list[dict] = []
     for s in steps[:max_steps]:
         if isinstance(s, dict) and s.get("tool") in TOOL_REGISTRY:
             valid.append({
@@ -509,6 +758,111 @@ def _is_error_message(instruction: str) -> bool:
         "Cell In[", "----->", "File \"", ".py\", line ",
     ]
     return any(sig in instruction for sig in error_signals)
+
+
+_ACT_OR_ANSWER_PROMPT = """\
+/no_think
+Decide whether this message can be answered from what is already known, or
+whether it needs work doing.
+
+WHAT IS ALREADY KNOWN (the session so far):
+{state}
+
+WHAT THIS AGENT CAN DO IF IT ACTS:
+{tools}
+
+MESSAGE FROM THE USER:
+{message}
+
+"answer" means everything needed is in the session state above and replying is
+enough. Examples: what columns are there, what does the brief say, what were
+the results, explain that again, thanks.
+
+"act" means the message asks for something that the state above does not
+already contain: something produced, computed, changed, looked up, or found
+out. Anything that should leave a file, a model, a figure, a plan or a new
+finding behind is "act". If a reply would have to DESCRIBE doing the work
+instead of doing it, the answer is "act".
+
+Reply with only this JSON: {{"decision": "answer" | "act", "why": "under 12 words"}}
+"""
+
+
+def _decide_action(instruction: str, session: Session, kernel: SessionKernel,
+                   llm_client: Any) -> tuple[bool, str]:
+    """Should this message be acted on, or just answered? Returns (act, why).
+
+    The model makes this call knowing what tools exist and what the session
+    already holds, because "do I need a tool?" cannot be answered by anything
+    that has not been shown the tools. It replaces a topic classifier whose six
+    labels collapsed into this one bit, so it costs no extra round trip.
+
+    Two different failures, two different fallbacks. A reply that cannot be
+    parsed means the model is working but was unclear, so act: the tool loop can
+    still answer a question without calling anything, whereas answering a
+    request to DO something only describes it, which is the failure a user
+    notices. A raised exception means the model is unreachable, and the tool
+    loop needs that same model, so fall back to answering and let the reply path
+    use its own offline handling.
+    """
+    try:
+        raw = llm_client._generate(
+            _ACT_OR_ANSWER_PROMPT.format(
+                state=_data_context(session, kernel, compact=True)[:1500],
+                tools=", ".join(sorted(TOOL_REGISTRY)),
+                message=instruction[:600]),
+            temperature=0.0, max_tokens=_ROUTER_TOKENS, json_mode=True)
+    except Exception:  # noqa: BLE001
+        return False, "model unreachable; answering from session context"
+    data = _extract_json(_strip_thinking(raw))
+    if isinstance(data, dict) and data.get("decision") in ("answer", "act"):
+        return data["decision"] == "act", str(data.get("why", ""))[:80]
+    return True, "unclear request; acting is the safer default"
+
+
+_EXPLORATION_PROMPT = """\
+Decide whether the user is asking for open-ended DATA ANALYSIS or EXPLORATION of
+the dataset that is already loaded — understanding the data, profiling it,
+finding patterns, relationships, distributions, group differences, anomalies,
+data-quality issues, or insights — phrased in ANY way, not only with the words
+"EDA" or "explore".
+
+TRUE examples (regardless of wording): "dig into these claims", "what is going
+on in this data", "give the dataset a thorough look", "find anything unusual",
+"analyse the data", "profile it", "what stands out", "understand the data",
+"look for fraud signals in the data".
+
+FALSE examples: train or evaluate a specific named model, build the notebook or
+report, deploy or package a model, read the brief, or a factual question whose
+answer is already in the session state (e.g. "how many rows", "what columns").
+
+MESSAGE FROM THE USER:
+{message}
+
+Reply with only this JSON: {{"exploration": true|false}}
+"""
+
+
+def _is_exploration_request(instruction: str, session: Session,
+                            kernel: SessionKernel, llm_client: Any) -> bool:
+    """LLM decision: is this a request for data analysis / exploration?
+
+    Routing must not be bound to a fixed keyword list — the user can ask for a
+    "deeper EDA and complete analysis" in countless phrasings. The model reads
+    the actual request and decides. Fail CLOSED: on any error or unparseable
+    reply return False so the caller falls back to the explicit keyword routes,
+    rather than sending a non-analysis request into the exploration loop.
+    """
+    if llm_client is None:
+        return False
+    try:
+        raw = llm_client._generate(
+            _EXPLORATION_PROMPT.format(message=instruction[:600]),
+            temperature=0.0, max_tokens=_ROUTER_TOKENS, json_mode=True)
+    except Exception:  # noqa: BLE001
+        return False
+    data = _extract_json(_strip_thinking(raw))
+    return bool(isinstance(data, dict) and data.get("exploration") is True)
 
 
 def _is_keyword_confident(instruction: str) -> bool:
@@ -819,6 +1173,9 @@ USER GOAL:
 TASK FOCUS:
 {task_focus}
 
+OPEN EDA AGENDA ITEMS:
+{agenda}
+
 TOOL CALLED: {tool}
 ARGUMENTS: {args}
 RESULT (truncated):
@@ -826,7 +1183,9 @@ RESULT (truncated):
 
 Reply with a single JSON object and nothing else:
 {{"verdict": "accept" | "retry" | "replan", "goal_met": true | false,
-  "finding": "one sentence on what this result reveals about the data or task",
+  "finding": "one sentence on what this result reveals, quoting its key numbers",
+  "answers": ["ids of the open agenda items this result settles, or none"],
+  "new_question": "one follow-up question this result raises that is worth answering, or empty",
   "next_step": "one sentence on the best next step given this result",
   "reason": "at most 15 words"}}
 
@@ -838,7 +1197,10 @@ Definitions:
 
 Ground finding and next_step in the actual numbers in the result. When a task
 focus is given, prefer next steps that explore the features and relationships
-most relevant to that outcome.
+most relevant to that outcome. List an agenda item in answers only when the
+result actually settles it. Ask a new_question only when the result shows
+something unexpected (an outlier entity, a skew, a relationship) that no open
+item covers.
 """
 
 
@@ -849,6 +1211,8 @@ class Critique:
     goal_met: bool
     finding: str = ""      # what the result revealed about the data or task
     next_step: str = ""    # the recommended next step, grounded in the result
+    answers: list[str] = field(default_factory=list)   # agenda ids it settles
+    new_question: str = ""  # a follow-up the result raised
 
 
 def _call_signature(tool_name: str, args: dict) -> str:
@@ -858,6 +1222,38 @@ def _call_signature(tool_name: str, args: dict) -> str:
         return f"{tool_name}:{json.dumps(args, sort_keys=True)[:200]}"
     except (TypeError, ValueError):
         return f"{tool_name}:{str(args)[:200]}"
+
+
+def _error_headline(err: str, limit: int = 220) -> str:
+    """The line of a traceback that says what actually went wrong.
+
+    A traceback opens with "Traceback (most recent call last):" and the frame
+    that raised, and closes with the exception. Truncating from the front, as
+    this used to, showed the user the header and nothing else: every failure
+    read as `Traceback (most recent call last): File ".../kernel.py", line 163,
+    in _work exec(`, which is the same text whatever went wrong.
+    """
+    lines = [ln.strip() for ln in (err or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return "(no error text)"
+    last = lines[-1]
+    # A SyntaxError prints the offending source and a caret before the message;
+    # keep the message, which is the line that names the problem.
+    if len(lines) > 1 and last.startswith("^"):
+        last = lines[-2]
+    return last[:limit]
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when a request ran out of time rather than failing outright.
+
+    The loops retry a failed LLM call once, which is right for a refused
+    connection but wrong for a timeout: the retry waits the full timeout again
+    and usually ends the same way, so a single slow call costs twice the budget.
+    Matching on the class name covers httpx, socket, and any wrapper without
+    importing them here.
+    """
+    return "timeout" in type(exc).__name__.lower()
 
 
 def _critique_step(
@@ -870,6 +1266,7 @@ def _critique_step(
     llm_client: Any,
     repeats: int,
     task_focus: str = "",
+    agenda: list[dict] | None = None,
 ) -> Critique:
     """Reflexion-style judgement of one tool result.
 
@@ -891,12 +1288,22 @@ def _critique_step(
 
     # Ambiguous success → ask the model, but never block on it.
     try:
+        # A standalone prompt on /api/generate, deliberately. Asking inside the
+        # loop's own conversation was measured slower (50.8 s against 21.5 s),
+        # because the critic then reprocesses the whole conversation, and it
+        # bought nothing: Ollama keeps more than one cache slot, so a separate
+        # critic call does not cost the loop its cached prefix (the next loop
+        # turn after one still evaluated its prompt in 0.46 s).
         raw = llm_client._generate(
             _CRITIC_PROMPT.format(
-                goal=goal[:500], task_focus=(task_focus or "(none given)")[:400],
+                goal=goal, task_focus=(task_focus or "(none given)"),
                 tool=tool_name, args=json.dumps(args)[:300],
-                observation=obs[:1200]),
-            temperature=0.0, max_tokens=280, json_mode=True,
+                agenda=("\n".join(f"[{a['id']}] {a['question'][:200]}"
+                                   for a in (agenda or [])
+                                   if a.get("status") != "answered")[:2500]
+                        or "(none)"),
+                observation=obs[:2500]),
+            temperature=0.0, max_tokens=_CRITIC_TOKENS, json_mode=True,
         )
         data = _extract_json(_strip_thinking(raw))
         if isinstance(data, dict) and data.get("verdict") in (
@@ -908,11 +1315,198 @@ def _critique_step(
             return Critique(
                 verdict, str(data.get("reason", ""))[:200],
                 bool(data.get("goal_met", False)),
-                finding=str(data.get("finding", ""))[:280],
-                next_step=str(data.get("next_step", ""))[:280])
+                finding=str(data.get("finding", ""))[:400],
+                next_step=str(data.get("next_step", ""))[:280],
+                answers=[str(i) for i in (data.get("answers") or [])
+                         if isinstance(i, (str, int))][:6]
+                if isinstance(data.get("answers"), list) else [],
+                new_question=str(data.get("new_question") or "")[:300])
     except Exception:  # noqa: BLE001
         pass
     return Critique("accept", "", False)
+
+
+def _execute_tool(name, args, *, session, kernel, llm_client):
+    """Validate schema and semantic constraints at the execution boundary."""
+    from jsonschema import validate
+
+    from agent.api.intent import check_action
+    tool = TOOL_REGISTRY.get(name)
+    if tool is None:
+        return ToolOutput(False, "", error="Unknown tool")
+    if getattr(kernel, "remaining_tool_calls", 1) <= 0 or time.monotonic() > getattr(kernel, "turn_deadline", float("inf")):
+        return ToolOutput(False, "", error="Turn execution budget exhausted.")
+    if hasattr(kernel, "remaining_tool_calls"):
+        kernel.remaining_tool_calls -= 1
+    try:
+        validate(args, getattr(tool, "input_schema", {"type": "object"}))
+    except Exception as exc:
+        return ToolOutput(False, "", error=f"Invalid tool arguments: {exc}")
+    intent = getattr(kernel, "task_intent", None)
+    if intent is not None:
+        if name not in intent.allowed_tools:
+            # Mechanical boundary, applied to every tool: a capability the
+            # interpreted request did not authorise never runs.
+            return ToolOutput(False, "", error="This tool is outside the interpreted request.")
+        if _needs_semantic_check(name):
+            ok, reason = check_action(intent, instruction=kernel.task_instruction,
+                                     brief=session.brief or "", name=name, args=args,
+                                     llm=llm_client)
+            if not ok:
+                return ToolOutput(False, "", error=reason)
+    return tool.execute(args, session=session, kernel=kernel, llm_client=llm_client)
+
+
+# Tools whose effects are read-only or confined: they read files or data,
+# compute in the host kernel without writing, or run in the isolated sandbox
+# (no network, no host writes; any file it makes is only a staged proposal).
+# For these the per-call LLM permission check bought no protection that the
+# mechanical allowed_tools check, the sandbox and the approval queue do not
+# already give, and it cost 9-180 s per call on the local model — enough that
+# a 12-step exploration ran past the 900 s turn deadline. Every other tool
+# (training, writing, deploying, external data, web) is still checked on each
+# call. DSAGENT_CHECK_ALL_ACTIONS=1 restores checking every call.
+_READ_ONLY_TOOLS = frozenset({
+    "execute_code", "eda_profile", "deep_eda", "quality_check",
+    "mutual_information", "visualize", "read_file", "read_instructions",
+    "search_files", "explore_directory", "understand_task",
+    "data_analysis_agent",
+})
+
+
+def _needs_semantic_check(name: str) -> bool:
+    if os.environ.get("DSAGENT_CHECK_ALL_ACTIONS", "0") == "1":
+        return True
+    return name not in _READ_ONLY_TOOLS
+
+
+def _grounded_reply(draft, steps, llm_client):
+    """Keep the model's interpretation, but only what the evidence supports.
+
+    Every number and file name in the draft must appear in the output of a
+    tool that completed this turn, at the precision the draft states it (so
+    "4.2" matches 4.211353 and "88%" matches 0.8755). A statement with an
+    unsupported figure or file is removed deterministically; no model judges
+    its own claims. Interpretation that states no figure is kept, which is
+    what the user asked for when they asked "why". Failed steps are summarised
+    in one line instead of being shown as tracebacks. If nothing supported
+    remains, the completed tool outputs themselves are shown.
+    """
+    if not steps:
+        return "No computation completed this turn. No results are available to report."
+    ok_steps = [s for s in steps if s.output.success]
+    failed = [s for s in steps if not s.output.success]
+    evidence = "\n".join((s.output.text or "") for s in ok_steps)
+    ev_numbers = [_as_number(m) for m in _NUMBER_RE.findall(evidence)]
+    ev_numbers = [v for v in ev_numbers if v is not None]
+    ev_lower = evidence.lower()
+
+    kept_lines: list[str] = []
+    removed = 0
+    for line in (draft or "").splitlines():
+        stripped = line.strip()
+        if not stripped or set(stripped) <= set("|-: "):
+            kept_lines.append(line)
+            continue
+        whole = stripped.startswith(("|", "-", "*", "#")) or bool(re.match(r"\d+\.\s", stripped))
+        units = [line] if whole else re.split(r"(?<=[.!?])\s+(?=[A-Z*(\[])", line)
+        kept_units = []
+        for unit in units:
+            if _unit_supported(unit, ev_numbers, ev_lower):
+                kept_units.append(unit)
+            else:
+                removed += 1
+        if kept_units:
+            kept_lines.append(" ".join(kept_units))
+    narrative = re.sub(r"\n{3,}", "\n\n", _drop_empty_tables(kept_lines)).strip()
+
+    evidence_block = "\n\n".join(
+        f"[E{i + 1}] {s.tool}:\n{(s.output.text or '')[:1500]}"
+        for i, s in enumerate(ok_steps))[:6000]
+    if not re.search(r"[A-Za-z]{3}", narrative):
+        narrative = evidence_block or "No analysis step completed this turn."
+    elif evidence_block and not any(
+            _is_metric(t) for t in _NUMBER_RE.findall(narrative)):
+        # The text cites no computed figure ("Analysis complete."), so show
+        # the results it rests on rather than leave the user without them.
+        narrative += "\n\nEvidence:\n" + evidence_block
+
+    notes = []
+    if ok_steps:
+        notes.append(f"Based on {len(ok_steps)} completed step(s): "
+                     + ", ".join(dict.fromkeys(s.tool for s in ok_steps)) + ".")
+    if failed:
+        heads = "; ".join(dict.fromkeys(_error_headline(s.output.error, 80) for s in failed))
+        notes.append(f"{len(failed)} step(s) failed and were not used: {heads}")
+    if removed:
+        notes.append(f"Removed {removed} statement(s) whose figures or files did not "
+                     "appear in any completed tool output.")
+    staged = [f for s in ok_steps for f in (s.output.artifacts or {}).get("scratch_outputs", [])]
+    if staged:
+        notes.append("Files produced but NOT yet in your folder (approve them under "
+                     "Pending changes to save): " + ", ".join(dict.fromkeys(staged)) + ".")
+    return narrative + ("\n\n---\n" + "\n".join(notes) if notes else "")
+
+
+# A number as written in prose or tool output: 7,733 / 637263.45 / -1.7 / 47%.
+# Not part of an identifier, so PRV020 or claim_id2 do not count as figures.
+_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_.])-?\d[\d,]*(?:\.\d+)?%?(?![A-Za-z0-9_])")
+_FILE_RE = re.compile(r"\b[\w\-]+\.(?:csv|png|xlsx|parquet|json|pkl|joblib|ipynb|html|pdf|txt|md)\b",
+                      re.IGNORECASE)
+
+
+def _drop_empty_tables(lines: list[str]) -> str:
+    """Remove a markdown table left with a header and no rows after filtering."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        is_sep = bool(nxt) and nxt.startswith("|") and set(nxt) <= set("|-: ")
+        if line.startswith("|") and is_sep:
+            j = i + 2
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                j += 1
+            if j > i + 2:
+                out.extend(lines[i:j])
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def _as_number(token: str) -> float | None:
+    try:
+        return float(token.rstrip("%").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _is_metric(token: str) -> bool:
+    """A figure worth checking: not a small count like "top 5" or "2 providers"."""
+    value = _as_number(token)
+    if value is None:
+        return False
+    return not (value.is_integer() and abs(value) <= 20
+                and "%" not in token and "." not in token)
+
+
+def _figure_supported(token: str, ev_numbers: list[float]) -> bool:
+    """True when some evidence value rounds to the figure as stated."""
+    value = _as_number(token)
+    if value is None or not _is_metric(token):
+        return True
+    digits = token.rstrip("%").replace(",", "")
+    places = len(digits.split(".")[1]) if "." in digits else 0
+    candidates = ev_numbers + ([e * 100 for e in ev_numbers] if token.endswith("%") else [])
+    return any(round(e, places) == round(value, places) for e in candidates)
+
+
+def _unit_supported(unit: str, ev_numbers: list[float], ev_lower: str) -> bool:
+    if any(not _figure_supported(t, ev_numbers) for t in _NUMBER_RE.findall(unit)):
+        return False
+    return all(f.lower() in ev_lower for f in _FILE_RE.findall(unit))
 
 
 def _tool_call_loop(
@@ -946,9 +1540,17 @@ def _tool_call_loop(
         if emit:
             emit(msg, tool=tool, level=level)
 
+    intent = getattr(kernel, "task_intent", None)
+    if intent is not None:
+        tool_names = [n for n in (tool_names or intent.allowed_tools)
+                      if n in intent.allowed_tools]
+    if _task_has_no_target(session, kernel):
+        tool_names = [n for n in (tool_names if tool_names is not None
+                                  else list(TOOL_REGISTRY))
+                      if n not in _TARGET_ONLY_TOOLS]
     tools = _build_ollama_tool_schemas(tool_names)
     system = system_prompt or _TOOLCALL_SYSTEM.format(
-        session_state=_data_context(session, kernel),
+        session_state=_data_context(session, kernel, compact=True),
         recent_history=_recent_history(session, n=6),
     )
     if prior_experience and system_prompt is None:
@@ -963,17 +1565,25 @@ def _tool_call_loop(
     task_focus = _task_focus(session, kernel)
 
     for _step_n in range(max_steps):
+        if getattr(kernel, "remaining_tool_calls", 1) <= 0 or time.monotonic() > getattr(kernel, "turn_deadline", float("inf")):
+            break
+        live_context = _data_context(session, kernel, compact=True)
+        active_system = system + "\nCURRENT STATE:\n" + live_context
+        if intent is not None:
+            active_system += "\nBINDING TASK:\n" + intent.model_dump_json()
         resp = None
         last_exc: Exception | None = None
         for _attempt in range(2):  # one retry on transient LLM/HTTP failure
             try:
                 resp = llm_client.chat_with_tools(
-                    messages, tools, system=system,
-                    temperature=0.0, max_tokens=800,
+                    messages, tools, system=active_system,
+                    temperature=0.0, max_tokens=_TOOL_TURN_TOKENS,
                 )
                 break
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                if _is_timeout(exc):
+                    break
 
         # None → native tool-calling unsupported: caller falls back.
         if resp is None:
@@ -1008,6 +1618,8 @@ def _tool_call_loop(
 
         # Execute each requested tool call.
         for call in calls:
+            if getattr(kernel, "remaining_tool_calls", 1) <= 0:
+                break
             fn = call.get("function", {}) if isinstance(call, dict) else {}
             raw_name = fn.get("name", "")
             args = _coerce_tool_args(fn.get("arguments"))
@@ -1015,6 +1627,7 @@ def _tool_call_loop(
             tool = TOOL_REGISTRY.get(resolved)
 
             call_success = False
+            step_figures: list[str] = []   # figures from THIS call only
             if tool is None:
                 obs = (f"ERROR: unknown tool '{raw_name}'. "
                        f"Choose from: {', '.join(TOOL_REGISTRY)}")
@@ -1023,12 +1636,26 @@ def _tool_call_loop(
                 _emit(f"Running {resolved}…", tool=resolved)
                 t0 = time.time()
                 try:
-                    out: ToolOutput = tool.execute(
-                        args, session=session, kernel=kernel,
+                    out: ToolOutput = _execute_tool(
+                        resolved, args, session=session, kernel=kernel,
                         llm_client=llm_client)
                     call_success = out.success
-                    obs = out.text if out.success else f"ERROR: {out.error}"
+                    obs = (out.text if out.success else
+                           f"ERROR: {_error_headline(out.error, 400)}\n\n"
+                           f"Full traceback:\n{out.error}")
                     all_figures.extend(out.figures)
+                    step_figures = list(out.figures or [])
+                    if out.success:
+                        # A record of what actually ran, independent of the
+                        # critic. EXPLORATION_LOG only exists when the critic
+                        # is enabled and says nothing about which tool wrote an
+                        # entry, so phase and staleness cannot be derived from
+                        # it. Bounded: names are short and the tail is enough.
+                        _run = kernel.namespace.setdefault("TOOLS_RUN", [])
+                        if isinstance(_run, list):
+                            _run.append(resolved)
+                            if len(_run) > 100:
+                                del _run[:-100]
                     elapsed = round(time.time() - t0, 2)
                     step_results.append(StepResult(
                         step=len(step_results) + 1, tool=resolved,
@@ -1038,27 +1665,80 @@ def _tool_call_loop(
                         _emit(f"✓ {resolved} done ({elapsed}s)",
                               tool=resolved, level="ok")
                     else:
-                        _emit(f"✗ {resolved} failed: {out.error[:150]}",
+                        _emit(f"✗ {resolved} failed: {_error_headline(out.error)}",
                               tool=resolved, level="error")
                 except Exception as exc:  # noqa: BLE001
                     obs = f"ERROR: tool crashed: {exc}"
                     _emit(f"✗ {resolved} crashed: {exc}",
                           tool=resolved, level="error")
 
+            # The newest result is the one being reasoned about, so it gets the
+            # full budget; older ones are squeezed to a gist. A flat 1500-char
+            # cap meant an eda_profile over 26 columns was cut to roughly its
+            # first third, and the model was planning from EDA it could not
+            # read. Compressing the tail keeps the prompt inside num_ctx.
+            for _m in messages:
+                if _m.get("role") == "tool" and len(_m.get("content", "")) > _OBS_TAIL_CHARS:
+                    _m["content"] = (_m["content"][:_OBS_TAIL_CHARS]
+                                     + "\n… [earlier result trimmed]")
             messages.append({
                 "role": "tool", "tool_name": resolved,
-                "content": (obs or "")[:1500],
+                "content": (obs or "")[:_OBS_CHARS],
             })
+
+            # Let the model look at the plots it just produced. Only the newest
+            # turn carries images: they are large, and the point is to read the
+            # chart in front of it, not to re-read every earlier one.
+            if _SEND_FIGURES and step_figures:
+                for _m in messages:
+                    _m.pop("images", None)
+                if llm_client.supports_vision() is not False:
+                    _imgs = [s for s in
+                             (_shrink_figure(f)
+                              for f in step_figures[:_MAX_FIGURES_SENT])
+                             if s]
+                    if _imgs:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"The {resolved} step produced the "
+                                f"{'figure' if len(_imgs) == 1 else 'figures'} "
+                                "attached. Read them and say what they show "
+                                "about the data before choosing the next step."),
+                            "images": _imgs,
+                        })
 
             # ── Critic: judge the result and steer the next turn ────────────
             if not _CRITIC_ENABLED:
+                continue
+            if (call_success and not _CRITIC_ALL_TOOLS
+                    and resolved in _CRITIC_SKIP_TOOLS):
+                # A successful retrieval needs no judgement; skipping it saves a
+                # full LLM call per step. Failures still fall through below,
+                # where the rule-based path handles them without an LLM call.
                 continue
             sig = _call_signature(resolved, args)
             attempts[sig] = attempts.get(sig, 0) + 1
             crit = _critique_step(
                 instruction, resolved, args, obs, call_success,
                 llm_client=llm_client, repeats=attempts[sig],
-                task_focus=task_focus)
+                task_focus=task_focus,
+                agenda=kernel.namespace.get("EDA_AGENDA"))
+            if call_success and crit.verdict == "accept":
+                from agent.api.agent_tools import add_lead, record_findings
+                settled = record_findings(kernel.namespace, crit.answers, crit.finding)
+                cells = getattr(kernel, "analysis_cells", None)
+                if resolved == "execute_code" and isinstance(cells, list) and cells:
+                    # The export shows each step with what it found.
+                    cells[-1]["finding"] = crit.finding
+                    cells[-1]["answers"] = settled
+                if settled:
+                    _emit(f"agenda: {', '.join(settled)} answered", tool="agenda",
+                          level="ok")
+                lead = add_lead(kernel.namespace, crit.new_question)
+                if lead:
+                    _emit(f"agenda: new lead {lead}: {crit.new_question[:140]}",
+                          tool="agenda")
             _emit(f"critic: {crit.verdict}"
                   + (f" — {crit.reason}" if crit.reason else ""),
                   tool="critic",
@@ -1141,15 +1821,17 @@ _AGENT_ROLES: dict[str, dict[str, Any]] = {
         "tools": ["explore_directory", "read_file", "search_files",
                   "connect_data", "sql_query", "understand_task",
                   "read_instructions", "aggregate_data", "quality_check",
-                  "infer_target"],
+                  "infer_target", "work_plan"],
     },
     "analyst": {
         "title": "Analyst",
-        "purpose": "explore and describe the data, reading each result before "
-                   "choosing the next step, and digging into the features and "
-                   "relationships most relevant to the task's expected outcome",
+        "purpose": "run the EDA: answer the plan's task questions AND its "
+                   "independent checks on the data, read each result before "
+                   "choosing the next step, then revise the plan (work_plan "
+                   "with revise=true) so the feature and model choices follow "
+                   "what the data showed",
         "tools": ["eda_profile", "deep_eda", "mutual_information",
-                  "data_analysis_agent", "visualize"],
+                  "data_analysis_agent", "visualize", "work_plan"],
     },
     "ml_engineer": {
         "title": "ML Engineer",
@@ -1186,11 +1868,16 @@ outside your role — the team handles the rest.
 
 Read each tool result before choosing the next call, and adapt: let what a
 result reveals decide the next step instead of following a fixed sequence. When
-the session state shows a TASK FOCUS, after the general checks prioritise the
-features and relationships most relevant to that outcome, and skip work that
-does not serve it. When the session state lists REQUIREMENTS TO SATISFY, address
-every requirement that falls within your role before you report, using
-execute_code for anything your standard tools do not cover.
+the session state lists REQUIREMENTS TO SATISFY, address every requirement that
+falls within your role before you report, using execute_code for anything your
+standard tools do not cover.
+
+If the session state lists EDA QUESTIONS FROM THE PLAN, they are your agenda.
+Answer the task questions AND the independent checks; the independent ones are
+how problems the brief never mentions get caught, so do not skip them because
+they look tangential. Use execute_code for anything the standard EDA tools do
+not cover, and state what each answer implies for the work, not just the
+number. A question you cannot settle is a finding too: say so and say why.
 
 CURRENT SESSION STATE:
 {session_state}
@@ -1215,7 +1902,12 @@ Rules:
 2. Call one specialist at a time and read its report before the next delegation.
 3. Do not do the work yourself and do not repeat a delegation that already
    succeeded.
-4. When the request is fully handled, stop delegating and write the final answer
+4. Plan in two passes, because a plan written before the data is seen is a
+   guess. Early on, have a specialist call `work_plan` to set out the approach.
+   After EDA has run, have the analyst call `work_plan` with revise=true so the
+   feature-engineering and model choices are rewritten from what the data
+   actually showed. Only then delegate the modelling.
+5. When the request is fully handled, stop delegating and write the final answer
    to the user as plain text.
 {prior_experience}
 CURRENT SESSION STATE:
@@ -1238,7 +1930,8 @@ def _run_specialist(
     spec = _AGENT_ROLES[role]
     system = _SPECIALIST_SYSTEM.format(
         title=spec["title"], purpose=spec["purpose"],
-        session_state=_data_context(session, kernel), subgoal=subgoal)
+        session_state=_data_context(session, kernel, compact=True),
+        subgoal=subgoal)
     if emit:
         emit(f"→ {spec['title']}: {subgoal[:80]}", tool=role)
     reply, steps, figs, _native = _tool_call_loop(
@@ -1307,7 +2000,7 @@ def _run_multiagent_loop(
         _emit("Recalled relevant prior work from memory.", tool="memory")
     system = _ORCH_SYSTEM.format(
         team=team, prior_experience=prior_block,
-        session_state=_data_context(session, kernel))
+        session_state=_data_context(session, kernel, compact=True))
     messages: list[dict] = [{"role": "user", "content": instruction}]
     all_steps: list[StepResult] = []
     all_figures: list[str] = []
@@ -1315,6 +2008,8 @@ def _run_multiagent_loop(
 
     _emit("Orchestrator planning…", tool="orchestrator")
     for _round in range(max_rounds):
+        system = _ORCH_SYSTEM.format(team=team, prior_experience=prior_block,
+                                    session_state=_data_context(session, kernel, compact=True))
         resp = None
         for _attempt in range(2):
             try:
@@ -1322,8 +2017,9 @@ def _run_multiagent_loop(
                     messages, handoffs, system=system,
                     temperature=0.0, max_tokens=700)
                 break
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                if _is_timeout(exc):
+                    break
         if resp is None:
             # Native tool-calling unsupported → signal fallback (only if we have
             # not already delegated any work).
@@ -1340,7 +2036,7 @@ def _run_multiagent_loop(
 
         if not calls:
             if content.strip():
-                return content.strip(), all_steps, all_figures, True
+                return _grounded_reply(content, all_steps, llm_client), all_steps, all_figures, True
             break
 
         for call in calls:
@@ -1355,6 +2051,23 @@ def _run_multiagent_loop(
             args = _coerce_tool_args(fn.get("arguments"))
             subgoal = (args.get("subgoal") or instruction).strip()
 
+            # Modelling must not start from a plan written before the data was
+            # seen. When EDA has produced findings the plan has not been
+            # revised for, send the orchestrator back to the analyst instead of
+            # letting it engineer features against assumptions.
+            if role == "ml_engineer" and work_plan_is_stale(kernel):
+                messages.append({
+                    "role": "tool", "tool_name": role,
+                    "content": (
+                        "BLOCKED: EDA has produced findings that the work plan "
+                        "has not been revised for, so the feature-engineering "
+                        "and model choices are still assumptions. Delegate to "
+                        "the analyst to call work_plan with revise=true first, "
+                        "then delegate the modelling.")})
+                _emit("Modelling held: the plan has not been revised since EDA.",
+                      tool="orchestrator", level="warn")
+                continue
+
             sig = _call_signature(role, {"subgoal": subgoal})
             if sig in done_delegations:
                 messages.append({
@@ -1365,7 +2078,8 @@ def _run_multiagent_loop(
             done_delegations.add(sig)
 
             report, steps, figs = _run_specialist(
-                role, subgoal, session, kernel, llm_client, emit=emit)
+                role, subgoal + "\nPrior evidence:\n" + _build_findings_context(instruction, instruction, all_steps),
+                session, kernel, llm_client, emit=emit)
             all_steps.extend(steps)
             all_figures.extend(figs)
             _emit(f"✓ {_AGENT_ROLES[role]['title']} done "
@@ -1397,7 +2111,7 @@ def _run_agentic_loop(
     kernel: SessionKernel,
     llm_client: Any,
     *,
-    max_steps: int = 8,
+    max_steps: int | None = None,
     emit: Any = None,
     ltm: Any = None,
     multiagent: bool | None = None,
@@ -1415,6 +2129,7 @@ def _run_agentic_loop(
 
     This is the single entry point run_reactive uses for build-style requests.
     """
+    max_steps = max_steps or _AGENT_MAX_STEPS
     use_multiagent = _MULTIAGENT if multiagent is None else bool(multiagent)
     prior = _recall_from_ltm(ltm, instruction, session)
     if _NATIVE_TOOLS and llm_client.supports_tools() is not False:
@@ -1521,8 +2236,8 @@ def _react_loop(
         else:
             t0 = time.time()
             try:
-                out: ToolOutput = tool.execute(
-                    parsed.action_input,
+                out: ToolOutput = _execute_tool(
+                    resolved, parsed.action_input,
                     session=session, kernel=kernel, llm_client=llm_client,
                 )
                 obs = out.text if out.success else f"ERROR: {out.error}"
@@ -1684,7 +2399,7 @@ def _keyword_plan(instruction: str, session: Session) -> list[dict]:
         add("quality_check", reason="Identify data quality issues")
 
         # Check if we already know from brief that aggregation is needed
-        _task_spec_placeholder = {}  # will be populated at runtime; we plan conservatively  # noqa: F841
+        _task_spec_placeholder: dict = {}  # will be populated at runtime; we plan conservatively  # noqa: F841
         # If brief mentions establishment/entity-level prediction, plan aggregate step
         agg_keywords = [
             "per establishment", "per customer", "per patient",
@@ -2178,7 +2893,7 @@ def _needs_clarification(
         if not (has_spec or has_target or has_brief or gives_goal):
             cols = []
             try:
-                cols = list(df.columns)[:15]
+                cols = list(df.columns)[:15] if df is not None else []
             except Exception:
                 pass
             col_hint = f" Available columns: {', '.join(map(str, cols))}." if cols else ""
@@ -2201,6 +2916,7 @@ def _classify_tools(
     Uses deterministic keyword matching first (fast, no LLM call needed for common
     requests), with a single constrained LLM call as fallback for ambiguous cases.
     """
+    plan: list[tuple[str, dict]]
     txt = instruction.lower()
 
     has_brief    = bool((getattr(session, "brief", None) or "").strip())
@@ -2272,24 +2988,20 @@ def _classify_tools(
         kernel.namespace.pop("FILE_ROLE_CLARIFICATION", None)
         return [("understand_task", {})]
 
-    # ── -1. Planning / strategy queries → LLM reasoning, no tool execution ───
-    # User wants the agent to think and write a plan, not run tools.
-    # Return [] so classify_intent → qa path uses LLM answer() with TASK_SPEC ctx.
-    # Guard condition: bypass tools when plan keyword present AND either:
-    #   (a) no "read/load/understand" verb — purely planning, OR
-    #   (b) TASK_SPEC already extracted — agent already knows the task, just write the plan.
-    _plan_w = {
-        "plan", "outline", "strategy", "strategise", "strategize",
-        "how would you", "what would you do", "walk me through",
-        "propose a", "suggest a plan", "suggest steps", "your plan",
-        "the plan", "what steps", "what's the plan", "how to solve",
-        "how do we", "how should we", "what is the approach",
-        "describe the approach", "describe your approach",
-    }
-    _read_w = {"read", "understand", "load", "re-read", "reload"}
-    if _hit(_plan_w) and (not _hit(_read_w) or has_task_spec):
-        # Planning/strategy query — let the LLM write the plan rather than run tools
-        return []
+    # NOTE: there used to be a keyword gate here ("plan", "strategy", ...) that
+    # returned [] whenever the message contained the word "plan", so it could
+    # bypass tool execution entirely — including for "plan AND PERFORM the EDA
+    # in depth", which described real work and still got answered as prose
+    # with nothing run. Patching it with a second keyword list to out-vote the
+    # first ("perform", "execute", "do the", ...) was the wrong fix: it is the
+    # same brittleness in the other direction, and there will always be a
+    # phrasing neither list anticipates. It is deleted rather than patched.
+    # Whether this is a pure "write me a plan" request or a "do it" request is
+    # exactly the question run_reactive's _decide_action already answers with
+    # an LLM call when nothing below matches — that is where this ambiguity
+    # belongs, not in a keyword list here. An explicit EDA/analysis keyword
+    # below is a fast-path to the SAME adaptive execution _decide_action would
+    # reach, not a different decision, so nothing is lost by removing this.
 
     # ── 0. File confirmation messages ("this is the second file", "use this") ─
     # User is confirming an upload or pointing at a file just loaded.
@@ -2310,12 +3022,33 @@ def _classify_tools(
     if has_brief and _hit(_scope_w) and not has_task_spec:
         return [("understand_task", {})]
 
-    # ── 2. EDA (includes quality check when explicitly requested) ────────────
-    if has_data and (_hit(_eda_w) or _hit(_qual_w)):
-        plan: list[tuple[str, dict]] = [("eda_profile", {})]
-        if _hit(_qual_w):
-            plan.append(("quality_check", {}))
-        return plan
+    # ── 2. EDA / exploration → adaptive LLM-driven loop ──────────────────────
+    # Exploration is not a fixed sequence of tools. The agent designs the EDA
+    # itself: it profiles, reads what the profile revealed, and decides the next
+    # analysis from that result (relationships, group-level aggregates, ratios),
+    # rather than always running the same canned steps. The sentinel routes
+    # run_reactive into _run_agentic_loop, where the model picks each tool from
+    # the accumulating observations. A bare quality check stays deterministic —
+    # it is one specific, well-defined tool, not open-ended exploration.
+    if has_data:
+        _eda_kw = _hit(_eda_w)
+        _qual_kw = _hit(_qual_w)
+        # A narrow, explicit quality check is one well-defined tool — keep it
+        # fast and deterministic.
+        if _qual_kw and not _eda_kw:
+            return [("quality_check", {})]
+        # Exploration / analysis intent is NOT bound to a keyword list. A
+        # keyword hit is a cheap fast-yes; for every other phrasing the LLM
+        # reads the request and decides. Either way it goes to the adaptive
+        # loop, which designs the EDA and reasons about each result. The LLM
+        # check is skipped for explicit build verbs (train/feature/deploy/
+        # notebook/monitor), which have their own deterministic routes below.
+        _explicit_build = (_hit(_train_w) or _hit(_fe_w) or _hit(_mi_w)
+                           or _hit(_nb_w) or _hit(_dep_w) or _hit(_mon_w))
+        if _eda_kw or (not _explicit_build
+                       and _is_exploration_request(
+                           instruction, session, kernel, llm_client)):
+            return [(_ADAPTIVE_SENTINEL, {})]
 
     # ── 2.5. Deep analysis pipeline ──────────────────────────────────────────
     # User explicitly requests specialist data analysis before model training.
@@ -2502,6 +3235,176 @@ def _llm_classify_tools(
         return []
 
 
+def _ensure_task_understood(session: Session, kernel: SessionKernel,
+                            llm_client: Any, emit: Any) -> list[StepResult]:
+    """Read and understand the brief before exploring, when one exists.
+
+    With a brief/instructions document loaded, the agent should know what the
+    task is, and therefore what kind and depth of EDA to do, before it touches
+    the data. So understand_task runs first and its spec lands in the kernel,
+    where _data_context surfaces it to the exploration loop as the task focus.
+    With no brief, this is a no-op and exploration starts straight on the data.
+    """
+    has_brief = bool((getattr(session, "brief", None) or "").strip())
+    has_spec = bool(kernel.namespace.get("TASK_SPEC"))
+    if not has_brief or has_spec:
+        return []
+    tool = TOOL_REGISTRY.get("understand_task")
+    if tool is None:
+        return []
+    if emit:
+        emit("📄 Reading the task instructions first, to shape the analysis…",
+             tool="understand_task")
+    t0 = time.time()
+    try:
+        out = tool.execute({}, session=session, kernel=kernel, llm_client=llm_client)
+    except Exception as exc:  # noqa: BLE001
+        out = ToolOutput(success=False, text="", error=f"Tool crashed: {exc}")
+    elapsed = round(time.time() - t0, 2)
+    if out.success:
+        spec = kernel.namespace.get("TASK_SPEC", {})
+        df = kernel.namespace.get("df")
+        if df is not None and spec:
+            _eda_scope_enrichment(spec, df, kernel, emit)
+        if emit:
+            desc = (spec or {}).get("task_description", "task")
+            emit(f"✓ Task understood ({elapsed}s): {str(desc)[:120]}",
+                 tool="understand_task", level="ok")
+    elif emit:
+        emit(f"⚠ Could not read the brief ({_error_headline(out.error)}); "
+             "exploring the data directly.", tool="understand_task", level="warn")
+    return [StepResult(step=0, tool="understand_task", args={},
+                       reason="Understand the task before exploring",
+                       output=out, elapsed_s=elapsed)]
+
+
+def _ensure_work_planned(session: Session, kernel: SessionKernel,
+                         llm_client: Any, emit: Any) -> list[StepResult]:
+    """Plan the work from the brief and the data before any analysis runs.
+
+    Whether a request needs a plan is the model's call, made when it interprets
+    the request (TaskIntent.plan_first). When it does and no plan exists yet,
+    work_plan runs here, so the EDA starts from questions the plan derived
+    from the task and the actual columns (surfaced by _data_context) instead
+    of the loop guessing its first steps, e.g. hunting for a target the task
+    does not have. A failed plan is reported and exploration continues.
+    """
+    intent = getattr(kernel, "task_intent", None)
+    if intent is None or not getattr(intent, "plan_first", False):
+        return []
+    if isinstance(kernel.namespace.get("WORK_PLAN"), dict):
+        return []
+    tool = TOOL_REGISTRY.get("work_plan")
+    if tool is None or kernel.namespace.get("df") is None:
+        return []
+    if emit:
+        emit("Planning the work from the instructions and the data before "
+             "exploring…", tool="work_plan")
+    t0 = time.time()
+    try:
+        out = tool.execute({}, session=session, kernel=kernel, llm_client=llm_client)
+    except Exception as exc:  # noqa: BLE001
+        out = ToolOutput(success=False, text="", error=f"Tool crashed: {exc}")
+    elapsed = round(time.time() - t0, 2)
+    if emit:
+        if out.success:
+            plan = kernel.namespace.get("WORK_PLAN") or {}
+            n_q = (len(plan.get("eda_questions_task") or [])
+                   + len(plan.get("eda_questions_independent") or []))
+            emit(f"✓ Plan written ({elapsed}s): {str(plan.get('objective', ''))[:160]} "
+                 f"({n_q} EDA questions)", tool="work_plan", level="ok")
+        else:
+            emit(f"⚠ Could not write a plan ({_error_headline(out.error)}); "
+                 "exploring without one.", tool="work_plan", level="warn")
+    return [StepResult(step=0, tool="work_plan", args={},
+                       reason="Plan the work before exploring",
+                       output=out, elapsed_s=elapsed)]
+
+
+def _with_plan_and_agenda(reply: str, steps: list[StepResult],
+                          kernel: SessionKernel) -> str:
+    """Put the stored plan and the agenda's coverage in the reply.
+
+    When a plan was written or revised this turn, the user gets that plan as
+    stored, not the model's retelling of it, which differed from the plan the
+    agent then followed. After any analysis, a closing line says how many
+    agenda questions were answered and which are still open.
+    """
+    ns = kernel.namespace
+    parts: list[str] = []
+    plan = ns.get("WORK_PLAN")
+    if isinstance(plan, dict) and any(s.tool == "work_plan" and s.output.success
+                                      for s in steps):
+        from agent.api.agent_tools import _plan_to_markdown
+        raw_spec = ns.get("TASK_SPEC")
+        md = _plan_to_markdown(plan, raw_spec if isinstance(raw_spec, dict) else {})
+        if md.startswith("# Analysis plan"):
+            md = md.split("\n", 1)[1].lstrip()
+        parts += [f"## Work plan (version {plan.get('version', 1)})\n\n{md}",
+                  f"## Results\n\n{reply}"]
+    else:
+        parts.append(reply)
+    agenda = ns.get("EDA_AGENDA")
+    analysed = any(s.output.success and s.tool not in ("work_plan", "understand_task")
+                   for s in steps)
+    if isinstance(agenda, list) and agenda and analysed:
+        open_items = [a for a in agenda if a.get("status") != "answered"]
+        line = (f"EDA agenda: {len(agenda) - len(open_items)} of {len(agenda)} "
+                "questions answered.")
+        if open_items:
+            line += " Still open: " + "; ".join(
+                f"[{a['id']}] {a['question'][:90]}" for a in open_items[:6])
+        parts.append(line)
+    return "\n\n".join(parts)
+
+
+def _run_guarded_adaptive(
+    instruction: str, session: Session, kernel: SessionKernel, llm_client: Any,
+    *, emit: Any, ltm: Any, multiagent: bool | None,
+) -> tuple[str, list[StepResult], list[str]]:
+    """Read the task (if a brief exists) then run the adaptive tool loop.
+
+    This is the ONE guarded execution path for "the user wants the analysis
+    actually done": every caller that decides that — whether by an explicit
+    keyword fast-path or by the LLM's own act/answer judgement in
+    _decide_action — routes through here, so both get the same guarantees:
+    the brief is read first so exploration is task-informed, and a reply is
+    never presented as a real result unless a tool actually produced it.
+    Before this was unified, the keyword fast-path got both guards and the
+    LLM-decided path got neither, so identical requests behaved differently
+    depending on which route happened to notice them.
+    """
+    pre_steps = _ensure_task_understood(session, kernel, llm_client, emit)
+    if any(not step.output.success or step.output.artifacts.get("clarification_pending") for step in pre_steps):
+        return "Task instructions could not be understood; execution stopped.", pre_steps, []
+    pre_steps += _ensure_work_planned(session, kernel, llm_client, emit)
+    if emit:
+        emit("Exploring adaptively — the agent will design the analysis "
+             "from what each step reveals.", tool="router")
+    reply, loop_steps, loop_figs = _run_agentic_loop(
+        instruction, session, kernel, llm_client,
+        emit=emit, ltm=ltm, multiagent=multiagent,
+    )
+    all_steps = pre_steps + loop_steps
+    if not reply.strip():
+        reply = ("(No response generated — the analysis did not run. "
+                 "Please try again.)")
+    # No-fabrication guard: a request that produced no executed tool has not
+    # analysed anything. Whatever the model wrote is ungrounded, so flag it
+    # rather than letting invented numbers, plots or saved files read as real
+    # results.
+    elif not any(s.output.success for s in loop_steps):
+        if emit:
+            emit("No analysis tool ran this turn — flagging the reply as "
+                 "not computed from the data.", tool="router", level="warn")
+        reply = (
+            "⚠ I could not run the analysis this turn, so nothing below was "
+            "computed from your data and no files were written. Please try "
+            "again.\n\n" + reply
+        )
+    return reply, all_steps, loop_figs
+
+
 # ── conversational runner (intent-classify → execute → synthesise) ────────────
 
 def run_reactive(
@@ -2527,160 +3430,61 @@ def run_reactive(
     structured tool-call JSON — a format they cannot reliably follow.
     """
     from agent.api import progress as _progress
+    from agent.api.agent_tools import get_tool_schemas
+    from agent.api.intent import interpret
 
+    started = time.time()
+    if getattr(session, "owner_id", None):
+        ltm = None
     def _emit(msg: str, tool: str = "", level: str = "info") -> None:
         if job_id:
             _progress.emit(job_id, msg, tool=tool, level=level)
 
-    # ── Memory isolation early-return ──────────────────────────────────────
-    if _MEMORY_OK:
-        iso_reply = _apply_isolation(instruction, session, None)
-        if iso_reply:
-            return AgentRunResult(
-                goal=instruction[:100],
-                reply=iso_reply,
-                steps=[],
-                figures=[],
-                elapsed_s=0.0,
-            )
-
-    started = time.time()
-    run_id = run_id or uuid.uuid4().hex[:8]
-    all_figures: list[str] = []
-    step_results: list[StepResult] = []
-
-    # File-write mode for this turn: the write/edit tools read FILE_WRITE_MODE
-    # from the kernel. None → leave the kernel/env default in place (the web-UI
-    # toggle sets this per message; suggest is the safe default).
-    if allow_writes is not None:
-        kernel.namespace["FILE_WRITE_MODE"] = "write" if allow_writes else "suggest"
-
-    # Step 1 — classify intent and build tool plan
-    _emit("Analysing your request…")
-    tool_plan = _classify_tools(instruction, session, kernel, llm_client)
-
-    # Step 1b — clarification gate: don't launch an expensive build on missing
-    # or ambiguous inputs. Cheaper to ask one question than run the wrong
-    # multi-minute pipeline on this hardware.
-    clarify = _needs_clarification(instruction, session, kernel, tool_plan)
-    if clarify:
-        _emit("Need a quick clarification.", tool="clarify")
-        return AgentRunResult(
-            goal=instruction[:100], reply=clarify,
-            steps=[], figures=[], elapsed_s=round(time.time() - started, 2),
-        )
-
-    # Step 2 — execute the tool plan
-    for i, (tool_name, tool_args) in enumerate(tool_plan[:max_tool_calls]):
-        resolved = _resolve_tool_name(tool_name)
-        tool = TOOL_REGISTRY.get(resolved)
-        if tool is None:
-            _emit(f"Unknown tool '{resolved}' — skipping", level="warn")
-            continue
-
-        _emit(f"Running {resolved}…", tool=resolved)
-        t0 = time.time()
-        try:
-            out: ToolOutput = tool.execute(
-                tool_args, session=session, kernel=kernel, llm_client=llm_client)
-            if resolved == "understand_task" and out.success:
-                _df = kernel.namespace.get("df")
-                _spec = kernel.namespace.get("TASK_SPEC", {})
-                if _df is not None and _spec:
-                    _spec = _eda_scope_enrichment(_spec, _df, kernel, _emit)
-        except Exception as exc:
-            out = ToolOutput(success=False, text="", error=f"Tool crashed: {exc}")
-
-        elapsed = round(time.time() - t0, 2)
-
-        if out.success:
-            preview = (out.text or "").splitlines()[0][:120] if out.text else ""
-            _emit(
-                f"✓ {resolved} done ({elapsed}s)"
-                + (f" — {preview}" if preview else ""),
-                tool=resolved, level="ok",
-            )
-        else:
-            _emit(f"✗ {resolved} failed ({elapsed}s): {out.error[:150]}",
-                  tool=resolved, level="error")
-
-        all_figures.extend(out.figures)
-        step_results.append(StepResult(
-            step=i + 1, tool=resolved, args=tool_args,
-            reason="", output=out, elapsed_s=elapsed,
-        ))
-
-        # Abort the rest of the plan when a step that PRODUCES state other
-        # steps depend on fails — e.g. understand_task (TASK_SPEC) or
-        # aggregate_data (the modelling frame). Running train_model afterwards
-        # would waste minutes on garbage input.
-        if not out.success and resolved in _DEPENDENCY_TOOLS:
-            remaining = tool_plan[i + 1:max_tool_calls]
-            if remaining:
-                _emit(
-                    f"Stopping: '{resolved}' failed and later steps depend on "
-                    f"it ({', '.join(n for n, _ in remaining)} skipped).",
-                    level="warn",
-                )
-            break
-
-    # Step 3 — synthesise response or answer directly
-    _emit("Generating response…", tool="synthesiser")
-    if step_results:
-        findings = _build_findings_context(instruction, instruction, step_results)
-        task_ctx = _data_context(session, kernel)
-        history_ctx = _recent_history(session, n=4)
-        reply = _synthesise(findings, llm_client,
-                            task_context=task_ctx, history=history_ctx)
-    else:
-        # No deterministic tool plan — route by intent
+    from agent.api import trace
+    trace.new_turn(getattr(session, "session_id", ""), instruction)
+    kernel.remaining_tool_calls = max_tool_calls
+    kernel.turn_deadline = time.monotonic() + float(os.environ.get("DSAGENT_JOB_TIMEOUT_S", "900"))
+    # Each turn starts from the explicit UI policy, never a previous worker's mode.
+    kernel.namespace["FILE_WRITE_MODE"] = "ask" if allow_writes else "suggest"
+    _emit("Interpreting your request and constraints…", tool="intent")
+    prior_intent = getattr(kernel, "task_intent", None)
+    context = _data_context(session, kernel) + "\nFULL BRIEF:\n" + (session.brief or "")
+    if prior_intent is not None:
+        context += "\nPREVIOUS TASK (reconcile with latest request):\n" + prior_intent.model_dump_json()
+    # Choosing capabilities needs each tool's name and purpose, not its full
+    # parameter schema: that halved the prompt (~4.4K -> ~2.3K tokens) on the
+    # call that runs before every turn. Arguments are validated at execution.
+    intent = interpret(instruction, context=context,
+                       history=[{"role": m.role, "content": m.text} for m in session.messages],
+                       tools=[{"name": t["name"], "description": t.get("description", "")}
+                              for t in get_tool_schemas()],
+                       llm=llm_client)
+    # Policy lives outside the executable Python namespace.
+    kernel.task_intent = intent
+    kernel.task_instruction = instruction
+    if intent.isolation is not None:
+        session.isolation_mode = intent.isolation
+    steps: list[StepResult] = []
+    figures: list[str] = []
+    if intent.decision == "clarify":
+        reply = intent.clarification or "Please clarify the intended outcome."
+    elif intent.decision == "answer":
         context = _data_context(session, kernel)
-        intent_result = llm_client.classify_intent(instruction)
-        # Route to _react_loop only for explicit pipeline-build intents.
-        # Everything else (qa, unknown, help, status) → direct LLM answer.
-        # This prevents the ReAct tool-calling loop from triggering on pure Q&A.
-        _loop_intents = {"build"}
-        if (intent_result.available
-                and intent_result.intent in _loop_intents):
-            reply, loop_steps, loop_figs = _run_agentic_loop(
-                instruction, session, kernel, llm_client,
-                max_steps=max_tool_calls, emit=_emit, ltm=ltm,
-                multiagent=multiagent,
-            )
-            step_results.extend(loop_steps)
-            all_figures.extend(loop_figs)
-        else:
-            _emit("Answering from session context…", tool="qa")
-            # Prefer the smart context builder: summarises older turns (summary
-            # buffer) and injects relevant cross-session LTM. Falls back to the
-            # fixed-window _chat_messages if memory layer is unavailable.
-            chat_messages = _build_qa_messages(session, llm_client, ltm, instruction)
-            chat_result = llm_client.answer(
-                instruction,
-                context=context,
-                messages=chat_messages,
-            )
-            # The multi-turn /api/chat reply skips llm-side cleanup, so apply
-            # the same guardrails used elsewhere: strip <think> blocks + leaked
-            # chat-template tokens + sentence-loop dedup, then trim any block
-            # that verbatim-echoes an earlier assistant turn (context bleed).
-            reply = _strip_thinking(chat_result.text)
-            reply = _trim_echoed_history(reply, session)
-        if not reply.strip():
-            reply = "(No response generated — please try again with more specific instructions.)"
-
-    # Write the exchange back to long-term memory so future sessions can recall
-    # it. Non-fatal: any failure (LTM offline, embed model missing) is ignored.
-    _store_to_ltm(ltm, session, instruction, reply, step_results)
-
+        context += "\nDo not claim new work, metrics, or files. No tools ran this turn."
+        reply = llm_client.answer(instruction, context=context,
+                    messages=_build_qa_messages(session, llm_client, ltm, instruction)).text
+    else:
+        reply, steps, figures = _run_guarded_adaptive(
+            instruction, session, kernel, llm_client, emit=_emit,
+            ltm=ltm, multiagent=multiagent)
+        reply = _grounded_reply(reply, steps, llm_client)
+        reply = _with_plan_and_agenda(reply, steps, kernel)
+    reply = _strip_thinking(reply)
     _emit("Done.", level="ok")
-    return AgentRunResult(
-        goal=instruction[:100],
-        reply=reply,
-        steps=step_results,
-        figures=all_figures,
-        elapsed_s=round(time.time() - started, 2),
-    )
+    # Persist computed evidence, not unchecked generated prose, in shared memory.
+    _store_to_ltm(ltm, session, instruction, "", steps)
+    return AgentRunResult(goal=intent.objective, reply=reply, steps=steps,
+                          figures=figures, elapsed_s=round(time.time() - started, 2))
 
 
 # ── main runner ───────────────────────────────────────────────────────────────
@@ -2901,7 +3705,7 @@ def run(
             _emit(f"✓ {tool_name} done ({elapsed}s){' — ' + preview if preview else ''}",
                   tool=tool_name, level="ok")
         else:
-            _emit(f"✗ {tool_name} failed ({elapsed}s): {out.error[:150]}",
+            _emit(f"✗ {tool_name} failed ({elapsed}s): {_error_headline(out.error)}",
                   tool=tool_name, level="error")
 
         step_results.append(StepResult(
@@ -3013,7 +3817,7 @@ def _recall_from_ltm(ltm: Any, instruction: str, session: Session) -> str:
     """Retrieve relevant past goals/solutions from long-term memory as a
     formatted block for prompt injection. Empty string when LTM is unavailable,
     isolation mode restricts it, or nothing relevant is found. Best-effort."""
-    if ltm is None:
+    if ltm is None or getattr(session, "owner_id", None):
         return ""
     try:
         iso = bool(getattr(session, "isolation_mode", False))
@@ -3027,7 +3831,7 @@ def _recall_from_ltm(ltm: Any, instruction: str, session: Session) -> str:
 def _store_to_ltm(ltm: Any, session: Session, instruction: str,
                   reply: str, step_results: list[StepResult]) -> None:
     """Persist this turn to long-term memory. Fully best-effort."""
-    if ltm is None or getattr(session, "isolation_mode", False):
+    if ltm is None or getattr(session, "isolation_mode", False) or getattr(session, "owner_id", None):
         return
     sid = getattr(session, "session_id", "") or ""
     try:

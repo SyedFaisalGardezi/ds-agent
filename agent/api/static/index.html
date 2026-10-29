@@ -134,6 +134,10 @@
   .think-warn { color: #ffd57a; }
   .think-tool { background: #21262d; border-radius: 3px; padding: 1px 5px;
                 color: #58a6ff; font-weight: 600; margin-right: 4px; font-size: 10px; }
+  /* Live seconds on the step in flight. A single model call can run for
+     minutes, and without this the log looks frozen. */
+  .think-elapsed { color: #6e7681; margin-left: 6px;
+                   font-variant-numeric: tabular-nums; }
   .think-result { padding: 12px 14px; border-top: 1px solid #2a2d36;
                   background: #14171f; font-size: 14px; line-height: 1.6;
                   white-space: pre-wrap; word-wrap: break-word; }
@@ -142,9 +146,50 @@
 </style>
 </head>
 <body>
+<style>
+  #login { position: fixed; inset: 0; background: #0f1116; display: flex;
+           align-items: center; justify-content: center; z-index: 1000; }
+  /* An ID selector outranks the browser's [hidden] rule, so state it here or
+     the overlay stays visible even when the hidden attribute is set. */
+  #login[hidden] { display: none !important; }
+  #login .card { background: #14171f; border: 1px solid #2a2d36;
+           border-radius: 12px; padding: 28px 26px; width: 340px; max-width: 90vw; }
+  #login h2 { margin: 0 0 4px; color: #ffd57a; }
+  #login .sub { color: #9aa4b2; font-size: 13px; margin: 0 0 16px; }
+  #login input { width: 100%; padding: 10px; margin-bottom: 10px; background: #1a1d24;
+           color: #e6e6e6; border: 1px solid #2a2d36; border-radius: 6px; font-size: 14px; }
+  #login button { width: 100%; padding: 10px; background: #ffd57a; color: #1a1d24;
+           border: 0; border-radius: 6px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+  #login button.link { background: none; color: #9aa4b2; font-weight: 400; }
+  #login .msg { font-size: 13px; color: #9aa4b2; min-height: 18px; margin-top: 4px; }
+  #login .msg.err { color: #e0808c; }
+  #login .msg.dev { color: #ffd57a; }
+  #whoami { font-size: 12px; color: #9aa4b2; margin-left: auto; margin-right: 10px; }
+  #whoami a { color: #9aa4b2; cursor: pointer; text-decoration: underline; }
+</style>
+<div id="login" hidden>
+  <div class="card">
+    <h2>ds-agent</h2>
+    <p class="sub">Sign in with your work email. We will send a verification code.</p>
+    <div id="login-email-step">
+      <input type="email" id="login-email" placeholder="you@company.com"
+             autocomplete="email"
+             onkeydown="if(event.key==='Enter')sendCode()">
+      <button onclick="sendCode()">Send code</button>
+    </div>
+    <div id="login-code-step" hidden>
+      <input type="text" id="login-code" placeholder="6-digit code" inputmode="numeric"
+             maxlength="6" onkeydown="if(event.key==='Enter')verifyCode()">
+      <button onclick="verifyCode()">Verify and sign in</button>
+      <button class="link" onclick="backToEmail()">Use a different email</button>
+    </div>
+    <div id="login-msg" class="msg"></div>
+  </div>
+</div>
 <header>
   <h1>ds-agent</h1>
   <span class="sid" id="sid">— no session —</span>
+  <span id="whoami"></span>
   <button onclick="newSession()">New session</button>
 </header>
 <main>
@@ -173,6 +218,10 @@
   </div>
   <div class="row" id="briefname">—</div>
 
+  <h2>Pending changes</h2>
+  <div class="row" id="pendingBox">Nothing waiting. The agent never writes to
+    disk without your approval.</div>
+
   <h2>Session</h2>
   <div class="row" id="state">—</div>
   <div class="row" id="nb">—</div>
@@ -183,16 +232,16 @@
   <div id="composer">
     <textarea id="input" placeholder="Try: 'build notebook' or 'what columns do I have?'"
               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
-    <label id="ma-toggle" class="ui-toggle on"
-           title="Multi-agent: an orchestrator delegates to specialist agents (data engineer, analyst, ML engineer, coder, researcher). Off = one faster single agent.">
+    <label id="ma-toggle" class="ui-toggle"
+           title="Multi-agent: an orchestrator delegates to specialist agents. OFF by default: a data-science pipeline is a dependency chain, and each handoff loses context — a specialist starts with only its sub-goal, and the final answer is written from truncated reports. ON is for breadth-first work with genuinely independent strands.">
       <span class="switch">
-        <input type="checkbox" id="ma-checkbox" checked onchange="onMaToggle()">
+        <input type="checkbox" id="ma-checkbox" onchange="onMaToggle()">
         <span class="slider"></span>
       </span>
       <span class="lbl">Multi-agent</span>
     </label>
     <label id="wr-toggle" class="ui-toggle"
-           title="File writes: ON applies the agent's file edits/writes to disk. OFF (default) only suggests them as diffs — nothing is written. Reads and searches always work.">
+           title="File writes: ON lets the agent propose changes to disk, which wait in Pending changes for your approval. OFF (default) only suggests them as diffs. Nothing is written until you approve it. Reads and searches always work.">
       <span class="switch">
         <input type="checkbox" id="wr-checkbox" onchange="onWrToggle()">
         <span class="slider"></span>
@@ -216,19 +265,22 @@ function esc(s) {
 // ── multi-agent toggle (per-message flag sent to the API) ──
 function maEnabled() {
   const cb = el('ma-checkbox');
-  return cb ? cb.checked : true;
+  return cb ? cb.checked : false;
 }
 function onMaToggle() {
   const on = maEnabled();
   el('ma-toggle').classList.toggle('on', on);
-  try { localStorage.setItem('ds_multiagent', on ? '1' : '0'); } catch (e) {}
+  // Key is versioned: anyone carrying the old 'ds_multiagent' = '1' would
+  // otherwise keep the orchestrator forever and the new default would look
+  // like it had never been applied.
+  try { localStorage.setItem('ds_multiagent_v2', on ? '1' : '0'); } catch (e) {}
   addMsg('system', on
-    ? 'Multi-agent ON — orchestrator will delegate to specialist agents.'
-    : 'Multi-agent OFF — using the single-agent loop (faster).');
+    ? 'Multi-agent ON — an orchestrator delegates to specialist agents. Each handoff starts a fresh context, so use it for independent strands of work rather than a pipeline.'
+    : 'Multi-agent OFF — one agent, one continuous conversation. This is the default.');
 }
 function restoreMaToggle() {
-  let on = true;
-  try { const v = localStorage.getItem('ds_multiagent'); if (v !== null) on = v === '1'; }
+  let on = false;
+  try { const v = localStorage.getItem('ds_multiagent_v2'); if (v !== null) on = v === '1'; }
   catch (e) {}
   const cb = el('ma-checkbox');
   if (cb) { cb.checked = on; el('ma-toggle').classList.toggle('on', on); }
@@ -244,7 +296,7 @@ function onWrToggle() {
   el('wr-toggle').classList.toggle('on', on);
   try { localStorage.setItem('ds_allow_writes', on ? '1' : '0'); } catch (e) {}
   addMsg('system', on
-    ? 'File writes ENABLED — the agent will apply edits and writes to disk (confined to the working directory).'
+    ? 'File writes ENABLED — the agent may now propose changes to disk. Each one waits in Pending changes for you to approve; nothing is written until you do.'
     : 'File writes OFF — the agent will only suggest edits as diffs; nothing is written.');
 }
 function restoreWrToggle() {
@@ -344,7 +396,27 @@ function appendThink(box, msg, tool, level) {
   const toolTag = tool ? `<span class="think-tool">[${tool}]</span> ` : '';
   d.innerHTML = toolTag + esc(msg);
   box.appendChild(d);
+  startElapsed(d);
   box.scrollTop = box.scrollHeight;
+}
+
+// A single model call on a large local model can take a minute or more, and
+// between two progress events nothing moves. Ticking the seconds on the newest
+// line shows the run is alive and how long the current step has taken.
+let _elapsedTimer = null;
+function startElapsed(line) {
+  stopElapsed();
+  const span = document.createElement('span');
+  span.className = 'think-elapsed';
+  line.appendChild(span);
+  const t0 = Date.now();
+  _elapsedTimer = setInterval(() => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    span.textContent = s >= 3 ? `${s}s` : '';   // quiet for quick steps
+  }, 1000);
+}
+function stopElapsed() {
+  if (_elapsedTimer) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
 }
 
 function openStream(streamUrl, thinkBox, jobId, bubble, onDone) {
@@ -355,15 +427,46 @@ function openStream(streamUrl, thinkBox, jobId, bubble, onDone) {
       appendThink(thinkBox, msg.message, msg.tool, msg.level);
     } else if (msg.type === 'done') {
       es.close();
+      stopElapsed();
       _stopSpinner(bubble, 'Done — rendering result…', false);
       pollAndRender(jobId, bubble, onDone);
     }
   };
   es.onerror = () => {
     es.close();
-    _stopSpinner(bubble, 'Stream closed — fetching result…', false);
+    stopElapsed();
+    _stopSpinner(bubble, 'Progress stream closed — waiting for the result…', false);
     pollAndRender(jobId, bubble, onDone);
   };
+}
+
+// Wait for the job to finish. Long analyses run for many minutes, so this
+// must not give up while the job is still running: a fixed number of polls
+// used to end after 20 s and render an empty "Done" for a run that later
+// finished with a full answer. A job past its deadline ('timeout') is usually
+// finishing its last step, so it gets a grace period before we stop waiting.
+async function waitForJob(jobId, bubble) {
+  const lbl = bubble.querySelector('.think-label');
+  const t0 = Date.now();
+  let job = null, overdueSince = null, misses = 0;
+  while (true) {
+    await new Promise(r => setTimeout(r, job ? 2000 : 800));
+    try {
+      const r = await fetch(`/chat/sessions/${SID}/jobs/${jobId}`);
+      if (r.status === 404) return null;
+      job = await r.json();
+      misses = 0;
+    } catch (_) {
+      if (++misses > 30) return job;   // server unreachable for about a minute
+      continue;
+    }
+    if (job.state === 'done' || job.state === 'failed') return job;
+    if (job.state === 'timeout') {
+      overdueSince = overdueSince || Date.now();
+      if (Date.now() - overdueSince > 600000) return job;
+    }
+    if (lbl) lbl.textContent = `Still working… ${Math.round((Date.now() - t0) / 1000)}s`;
+  }
 }
 
 function _stopSpinner(bubble, label, isErr) {
@@ -378,24 +481,15 @@ function _stopSpinner(bubble, label, isErr) {
 }
 
 async function pollAndRender(jobId, bubble, onDone) {
-  // Job might still be in the process of being marked done; poll briefly.
-  let job = null;
-  for (let attempt = 0; attempt < 25; attempt++) {
-    await new Promise(r => setTimeout(r, 800));
-    try {
-      const r = await fetch(`/chat/sessions/${SID}/jobs/${jobId}`);
-      job = await r.json();
-    } catch (_) { continue; }
-    if (job.state === 'done' || job.state === 'failed') break;
-  }
+  const job = await waitForJob(jobId, bubble);
   if (!job) {
     _stopSpinner(bubble, 'Could not fetch result', true);
     if (onDone) onDone();
     return;
   }
 
-  if (job.state === 'failed') {
-    _stopSpinner(bubble, 'Job failed', true);
+  if (job.state !== 'done') {
+    _stopSpinner(bubble, job.state === 'failed' ? 'Job failed' : 'Job did not finish', true);
     const errDiv = document.createElement('div');
     errDiv.className = 'think-result';
     errDiv.innerHTML = `<span class="badge err">failed</span><pre style="color:#f08080;white-space:pre-wrap;margin:6px 0">${esc(job.error || 'unknown error')}</pre>`;
@@ -562,18 +656,87 @@ async function refreshState() {
   el('nb').innerHTML = j.notebook_ready
     ? `<a class="download" href="/chat/sessions/${SID}/notebook" download>↓ download notebook</a>`
     : '<i style="color:#666">notebook not built</i>';
+  refreshPending();
+}
+
+// Disk changes the agent wants to make. They are staged, never applied, until
+// approved here.
+async function refreshPending() {
+  if (!SID) return;
+  let items = [];
+  try {
+    const r = await fetch(`/chat/sessions/${SID}/pending`);
+    items = (await r.json()).pending || [];
+  } catch (e) { return; }
+  const box = el('pendingBox');
+  if (!items.length) {
+    box.innerHTML = 'Nothing waiting. The agent never writes to disk without '
+      + 'your approval.';
+    return;
+  }
+  box.innerHTML = items.map(it => {
+    const dirs = (it.make_dirs || []).length
+      ? `<div style="color:#e0a030">creates ${it.make_dirs.length} new folder(s)</div>`
+      : '';
+    const diff = it.diff
+      ? `<pre style="max-height:140px;overflow:auto;font-size:11px;margin:4px 0">`
+        + escapeHtml(it.diff.slice(0, 1200)) + `</pre>`
+      : '';
+    return `<div style="border:1px solid #333;border-radius:6px;padding:8px;margin-bottom:8px">
+      <div><b>${escapeHtml(it.summary || it.rel || '')}</b></div>
+      <div style="color:#888;font-size:11px">${escapeHtml(it.rel || '')}</div>
+      ${dirs}${diff}
+      <button onclick="decidePending('apply', '${it.id}')">Approve</button>
+      <button onclick="decidePending('discard', '${it.id}')">Reject</button>
+    </div>`;
+  }).join('')
+    + `<button onclick="decidePending('apply', null)">Approve all</button>
+       <button onclick="decidePending('discard', null)">Reject all</button>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+async function decidePending(action, id) {
+  if (!SID) return;
+  const r = await fetch(`/chat/sessions/${SID}/pending/${action}`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({ids: id ? [id] : null})});
+  const j = await r.json();
+  if (action === 'apply') {
+    (j.applied || []).forEach(a => addMsg('assistant', `Applied: ${a.summary}`));
+    (j.failed || []).forEach(f => addMsg('assistant', `Failed: ${f.rel} (${f.error})`));
+  } else if (j.discarded) {
+    addMsg('assistant', `Rejected ${j.discarded} change(s). Nothing was written.`);
+  }
+  refreshPending();
 }
 
 async function setWorkDir() {
   if (!SID) { alert('Start a session first.'); return; }
   const p = el('workdir').value.trim();
   if (!p) return;
+  // create:false so a mistyped path is reported instead of being created as an
+  // empty directory that then becomes the workspace.
   const r = await fetch(`/chat/sessions/${SID}/workdir`,
     {method: 'POST', headers: {'Content-Type': 'application/json'},
-     body: JSON.stringify({path: p, create: true})});
+     body: JSON.stringify({path: p, create: false})});
   const j = await r.json();
   if (!r.ok) { addMsg('assistant', 'workdir failed: ' + (j.detail || 'error')); return; }
-  addMsg('assistant', `Working directory set to ${j.work_dir}.`);
+  // No full stop after the path: it used to be copied back into the box as part
+  // of the path, which is how an empty "<name>." directory got created.
+  const n = (j.workspace || {}).n_files || 0;
+  let msg = `Working directory set to ${j.work_dir}`;
+  if (n) {
+    msg += ` (${n} file${n === 1 ? '' : 's'} mapped)`;
+    if ((j.loaded_data || []).length) msg += `\nData loaded: ${j.loaded_data.join(', ')}`;
+    if ((j.loaded_briefs || []).length) msg += `\nBriefs loaded: ${j.loaded_briefs.join(', ')}`;
+  } else {
+    msg += '\n\nWARNING: this directory is empty. Check the path before running anything.';
+  }
+  addMsg('assistant', msg);
   refreshState();
 }
 
@@ -633,8 +796,80 @@ wireDrop('dropzone', 'filein', uploadData);
 wireDrop('briefzone', 'briefin', uploadBrief);
 
 // restore the composer toggles from the last visit, then start a session
+// ── email verification-code login ──
+let AUTH_EMAIL = null;
+function loginMsg(text, cls) {
+  const m = el('login-msg');
+  m.textContent = text || '';
+  m.className = 'msg' + (cls ? ' ' + cls : '');
+}
+function setTokenCookie(t) {
+  document.cookie = 'ds_token=' + t + '; path=/; max-age=86400; samesite=lax';
+  try { localStorage.setItem('ds_token', t); } catch (e) {}
+}
+async function initAuth() {
+  let status;
+  try { status = await (await fetch('/auth/status')).json(); }
+  catch (e) { status = { auth_required: false }; }
+  if (status.auth_required && !status.user) {
+    el('login').hidden = false;
+    el('login-email').focus();
+    return;               // wait for sign-in before starting a session
+  }
+  if (status.user) {
+    el('whoami').innerHTML = 'Signed in as ' + esc(status.user.email) +
+      ' · <a onclick="logout()">Sign out</a>';
+  }
+  newSession();
+}
+async function sendCode() {
+  const email = el('login-email').value.trim();
+  if (!email) { loginMsg('Enter your email.', 'err'); return; }
+  AUTH_EMAIL = email;
+  loginMsg('Sending code...');
+  try {
+    const r = await (await fetch('/auth/request-code',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }) })).json();
+    el('login-email-step').hidden = true;
+    el('login-code-step').hidden = false;
+    el('login-code').focus();
+    if (r.dev_code) loginMsg('Dev mode: your code is ' + r.dev_code, 'dev');
+    else loginMsg('Code sent to ' + email + '. Check your email.');
+  } catch (e) { loginMsg('Could not send the code.', 'err'); }
+}
+async function verifyCode() {
+  const code = el('login-code').value.trim();
+  if (!code) { loginMsg('Enter the code.', 'err'); return; }
+  loginMsg('Verifying...');
+  try {
+    const res = await fetch('/auth/verify-code',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: AUTH_EMAIL, code }) });
+    if (!res.ok) { loginMsg('Invalid or expired code.', 'err'); return; }
+    const v = await res.json();
+    setTokenCookie(v.token);
+    el('login').hidden = true;
+    el('whoami').innerHTML = 'Signed in as ' + esc(v.user.email) +
+      ' · <a onclick="logout()">Sign out</a>';
+    newSession();
+  } catch (e) { loginMsg('Verification failed.', 'err'); }
+}
+function backToEmail() {
+  el('login-code-step').hidden = true;
+  el('login-email-step').hidden = false;
+  loginMsg('');
+}
+function logout() {
+  document.cookie = 'ds_token=; path=/; max-age=0';
+  try { localStorage.removeItem('ds_token'); } catch (e) {}
+  location.reload();
+}
+
 restoreMaToggle();
 restoreWrToggle();
+// Login is disabled for now. To re-enable email-code sign-in later, change the
+// next line back to initAuth() and start the server with DSAGENT_AUTH_ENABLED=1.
 newSession();
 </script>
 </body>

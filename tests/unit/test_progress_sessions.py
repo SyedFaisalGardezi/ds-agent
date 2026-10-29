@@ -276,6 +276,7 @@ def test_to_public_includes_brief_filenames():
 def test_load_secondary_csv(tmp_path):
     """_load_secondary loads a CSV into kernel as the given var_name."""
     import pandas as pd
+
     from agent.api.chat import _load_secondary
     from agent.api.kernel import SessionKernel
 
@@ -295,11 +296,12 @@ def test_load_secondary_unsupported_ext(tmp_path):
     from agent.api.chat import _load_secondary
     from agent.api.kernel import SessionKernel
 
-    fake = tmp_path / "file.json"
+    fake = tmp_path / "file.unsupported"
     fake.write_text("{}")
     kernel = SessionKernel()
     msg = _load_secondary(kernel, fake, "df2")
-    assert "Unsupported" in msg or "unsupported" in msg.lower()
+    assert "Could not load" in msg
+    assert "df2" not in kernel.namespace
 
 
 def test_load_secondary_missing_file(tmp_path):
@@ -318,6 +320,7 @@ def test_load_secondary_missing_file(tmp_path):
 def test_load_secondary_parquet(tmp_path):
     """_load_secondary loads a parquet file into kernel as var_name."""
     import pandas as pd
+
     from agent.api.chat import _load_secondary
     from agent.api.kernel import SessionKernel
 
@@ -325,7 +328,7 @@ def test_load_secondary_parquet(tmp_path):
     pd.DataFrame({"a": range(5)}).to_parquet(pq, index=False)
 
     kernel = SessionKernel()
-    msg = _load_secondary(kernel, pq, "df3")
+    _load_secondary(kernel, pq, "df3")
     assert kernel.namespace.get("df3") is not None
     assert len(kernel.namespace["df3"]) == 5
 
@@ -333,6 +336,7 @@ def test_load_secondary_parquet(tmp_path):
 def test_load_secondary_tsv(tmp_path):
     """_load_secondary loads a TSV file into kernel as var_name."""
     import pandas as pd
+
     from agent.api.chat import _load_secondary
     from agent.api.kernel import SessionKernel
 
@@ -340,7 +344,7 @@ def test_load_secondary_tsv(tmp_path):
     pd.DataFrame({"col": ["a", "b", "c"]}).to_csv(tsv, sep="\t", index=False)
 
     kernel = SessionKernel()
-    msg = _load_secondary(kernel, tsv, "df4")
+    _load_secondary(kernel, tsv, "df4")
     assert kernel.namespace.get("df4") is not None
     assert len(kernel.namespace["df4"]) == 3
 
@@ -349,6 +353,7 @@ def test_load_secondary_excel(tmp_path):
     """_load_secondary loads an xlsx file into kernel as var_name."""
     pytest.importorskip("openpyxl")
     import pandas as pd
+
     from agent.api.chat import _load_secondary
     from agent.api.kernel import SessionKernel
 
@@ -356,5 +361,5 @@ def test_load_secondary_excel(tmp_path):
     pd.DataFrame({"val": [1, 2]}).to_excel(xls, index=False)
 
     kernel = SessionKernel()
-    msg = _load_secondary(kernel, xls, "df5")
+    _load_secondary(kernel, xls, "df5")
     assert kernel.namespace.get("df5") is not None

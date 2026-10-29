@@ -250,3 +250,64 @@ def test_enrich_unknown_task_type_becomes_binary(binary_df):
     result = SpecEnricher().enrich(raw, binary_df, list(binary_df.columns))
     # With binary outcome column, should detect binary_classification
     assert result.task_type in ("binary_classification", "unknown")
+
+
+# ── unlabelled data: never invent a target (review follow-up) ────────────────
+
+def _claims_like() -> pd.DataFrame:
+    """Shape of the ACC claims data: IDs, dates, categories, amounts, no label."""
+    n = 60
+    return pd.DataFrame({
+        "claim_id": [f"CLM{i:05d}" for i in range(n)],
+        "service_date": pd.date_range("2023-01-01", periods=n, freq="D").astype(str),
+        "provider_id": [f"PRV{i % 7:03d}" for i in range(n)],
+        "billed_amount": np.linspace(20.0, 200.0, n),
+        "paid_amount": np.linspace(18.0, 180.0, n),
+    })
+
+
+def test_infer_target_returns_empty_when_no_column_is_a_label():
+    """The first column to tie at score 0 used to win — that was service_date."""
+    df = _claims_like()
+    col, reason = SpecEnricher()._infer_target_from_data(df, list(df.columns))
+    assert col == ""
+    assert "label" in reason
+
+
+def test_date_named_as_target_is_rejected():
+    df = _claims_like()
+    spec = SpecEnricher().enrich(_raw_spec(target_column_hint="service_date",
+                                           task_description=""), df, list(df.columns))
+    assert spec.target_column == ""
+    assert "Predict" not in spec.task_description
+
+
+def test_unsupervised_task_has_no_target_and_is_valid():
+    df = _claims_like()
+    spec = SpecEnricher().enrich(_raw_spec(task_type="anomaly_detection",
+                                           target_column_hint="paid_amount"),
+                                 df, list(df.columns))
+    assert spec.target_column == ""
+    ok, failures = TaskSpecValidator().validate(spec, list(df.columns))
+    assert not any("target_column" in f for f in failures)
+
+
+def test_real_labels_are_still_found():
+    binary = pd.DataFrame({"age": range(40), "churn": [0, 1] * 20})
+    assert SpecEnricher()._infer_target_from_data(binary, list(binary.columns))[0] == "churn"
+    price = pd.DataFrame({"sqft": range(100), "price": [100.5 + i * 7.3 for i in range(100)]})
+    spec = SpecEnricher().enrich(_raw_spec(task_type="regression", target_column_hint="price",
+                                           evaluation_metric="rmse"), price, list(price.columns))
+    assert spec.target_column == "price"   # continuous regression target is not an "identifier"
+
+
+def test_unlabelled_task_gets_no_invented_metric_or_row_level_aggregation():
+    df = _claims_like()
+    df["claim_id"] = [f"C{i}" for i in range(len(df))]
+    spec = SpecEnricher().enrich(_raw_spec(task_type="anomaly_detection", evaluation_metric="",
+                                           aggregation_needed=True, aggregation_key="claim_id"),
+                                 df, list(df.columns))
+    assert spec.evaluation_metric == ""
+    assert not spec.aggregation_needed and spec.aggregation_key == ""
+    ok, failures = TaskSpecValidator().validate(spec, list(df.columns))
+    assert not any("evaluation_metric" in f for f in failures)

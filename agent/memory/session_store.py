@@ -8,13 +8,14 @@ Storage: ~/.ds-agent/memory/agent_memory.db
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DB_PATH = Path.home() / ".ds-agent" / "memory" / "agent_memory.db"
+DEFAULT_DB_PATH = Path(os.environ.get("DSAGENT_STATE_DIR", str(Path.home() / ".ds-agent"))) / "memory" / "agent_memory.db"
 
 
 class PersistentSessionStore:
@@ -67,6 +68,11 @@ class PersistentSessionStore:
                     ON messages(session_id, id);
             """)
 
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)")}
+            for name in ("owner_id", "work_dir"):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} TEXT")
+
     # ── Session CRUD ─────────────────────────────────────────────────────────
 
     def create_session(self, session_id: str) -> None:
@@ -85,6 +91,8 @@ class PersistentSessionStore:
         with self._lock:
             self._conn.execute(
                 """UPDATE sessions SET
+                   owner_id        = ?,
+                   work_dir        = ?,
                    target          = ?,
                    brief           = ?,
                    brief_filenames = ?,
@@ -95,6 +103,8 @@ class PersistentSessionStore:
                    updated_at      = ?
                    WHERE session_id = ?""",
                 (
+                    getattr(session, "owner_id", None),
+                    str(session.work_dir) if getattr(session, "work_dir", None) else None,
                     session.target,
                     session.brief,
                     json.dumps(getattr(session, "brief_filenames", [])),

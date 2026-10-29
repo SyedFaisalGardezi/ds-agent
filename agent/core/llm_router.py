@@ -12,7 +12,7 @@ from langchain_ollama import OllamaLLM
 # deleted gemma4:latest / never-installed qwen2.5-coder:7b).
 _FALLBACK_MODEL = os.environ.get(
     "DSAGENT_SCOPE_MODEL",
-    "qwen3.8:27b-mlx",
+    "gpt-oss:20b",
 )
 
 TASK_MODEL_MAP: dict[str, str] = {

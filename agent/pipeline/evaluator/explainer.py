@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
 
 from agent.core.types import ToolResult
 
@@ -14,7 +15,7 @@ class ModelExplainer:
         self._rs = int(random_state)
 
     def shap_values(self, model, df: pd.DataFrame) -> ToolResult:
-        X = df.select_dtypes("number").fillna(0.0)
+        X = df.copy() if isinstance(model, Pipeline) else df.select_dtypes("number").fillna(0.0)
         if X.shape[1] == 0:
             return ToolResult(status="error", data=None,
                               explanation="no numeric features",
@@ -35,12 +36,12 @@ class ModelExplainer:
             method = "shap"
         except Exception:
             try:
-                pred = model.predict(X.to_numpy())
+                pred = model.predict(X if isinstance(model, Pipeline) else X.to_numpy())
             except Exception as exc:  # noqa: BLE001
                 return ToolResult(status="error", data=None,
                                   explanation=f"model.predict failed: {exc}",
                                   math_trace="", error=type(exc).__name__)
-            pi = permutation_importance(model, X.to_numpy(), pred,
+            pi = permutation_importance(model, X if isinstance(model, Pipeline) else X.to_numpy(), pred,
                                         n_repeats=5, random_state=self._rs, n_jobs=1)
             mean_abs = pi.importances_mean
             method = "permutation_importance"

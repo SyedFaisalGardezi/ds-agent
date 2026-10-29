@@ -16,9 +16,9 @@ Tools can be called from:
 """
 from __future__ import annotations
 
+import json
 import os
 import textwrap
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ class ToolOutput:
     artifacts: dict[str, Any] = field(default_factory=dict)
     figures: list[str] = field(default_factory=list)   # base64 PNG
     error: str = ""
+    math_trace: str = ""
 
 
 # ── base class ────────────────────────────────────────────────────────────────
@@ -382,6 +383,51 @@ class QualityCheckTool(BaseTool):
         )
 
 
+def _is_unsuitable_target(df, col) -> tuple[bool, str]:
+    """Reject columns that cannot be a supervised prediction target.
+
+    A date/time column, an identifier (a distinct value in nearly every row),
+    or a constant is not something to predict. Selecting one produces the
+    service_date-as-target failure: a label derived from the date is then
+    "predicted" from date features, which leaks and scores a perfect AUC, and
+    the datetime column crashes the model. Returns (unsuitable, reason).
+    """
+    import warnings
+
+    import pandas as _pd
+    s = df[col]
+    n = len(s)
+    nun = int(s.nunique(dropna=True))
+    if nun <= 1:
+        return True, "it is constant (one unique value)"
+    if _pd.api.types.is_datetime64_any_dtype(s):
+        return True, "it is a date/time column"
+    # An identifier has many distinct values, close to one per row.
+    if not _pd.api.types.is_numeric_dtype(s) and nun > 50 and n > 0 and nun / n > 0.5:
+        return True, f"it looks like an identifier ({nun} unique values in {n} rows)"
+    # A date stored as text (e.g. service_date as an object column).
+    if s.dtype == object:
+        sample = s.dropna().astype(str).head(200)
+        if len(sample) >= 5:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                parsed = _pd.to_datetime(sample, errors="coerce")
+            if parsed.notna().mean() >= 0.8:
+                return True, "its values are dates"
+    return False, ""
+
+
+_NO_TARGET_MSG = (
+    "No suitable supervised target column was found (rejected: {detail}). The "
+    "dataset looks UNLABELLED: the candidate columns are dates or identifiers, "
+    "which cannot be a prediction target. Do NOT invent a label and train a "
+    "classifier on it — that only leaks and scores a meaningless perfect AUC. "
+    "If the task is fraud or anomaly detection, use unsupervised methods "
+    "(IsolationForest / DBSCAN) and rule-based rate indicators per provider "
+    "(e.g. paid-to-billed ratio, claims per client, price vs peer median)."
+)
+
+
 class InferTargetTool(BaseTool):
     name = "infer_target"
     description = (
@@ -397,42 +443,21 @@ class InferTargetTool(BaseTool):
     }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
-        from agent.api.spec_enricher import SpecEnricher
         df = kernel.namespace.get("df")
         if df is None:
             return ToolOutput(success=False, text="No dataframe loaded.",
                               error="df is None")
 
-        # Priority 1: TASK_SPEC already set by understand_task
-        task_spec = kernel.namespace.get("TASK_SPEC", {})
-        if task_spec and task_spec.get("target_column"):
-            target = task_spec["target_column"]
-            if target in df.columns:
-                session.target = target
-                kernel.namespace["TARGET"] = target
-                return ToolOutput(
-                    success=True,
-                    text=f"Target set from task spec: `{target}`\n"
-                         f"Unique: {df[target].nunique()} | Dtype: {df[target].dtype}",
-                    artifacts={"target": target},
-                )
+        rejected: list[str] = []
 
-        # Priority 2: data-driven inference via SpecEnricher (no LLM)
-        enricher = SpecEnricher()
-        hint = args.get("hint", "")
-        target, reason = enricher._infer_target_from_data(
-            df, list(df.columns), exclude=[]
-        )
-        # If user provided a hint, prefer columns matching it
-        if hint:
-            hint_lo = hint.lower()
-            for col in df.columns:
-                if hint_lo in col.lower():
-                    target = col
-                    reason = f"hint match: '{hint}'"
-                    break
-
-        if target:
+        def _accept(target: str, reason: str) -> ToolOutput | None:
+            """Set the target only if it survives the suitability guard."""
+            if not target or target not in df.columns:
+                return None
+            bad, why = _is_unsuitable_target(df, target)
+            if bad:
+                rejected.append(f"`{target}` ({why})")
+                return None
             session.target = target
             kernel.namespace["TARGET"] = target
             return ToolOutput(
@@ -443,32 +468,42 @@ class InferTargetTool(BaseTool):
                 artifacts={"target": target},
             )
 
-        # Priority 3: constrained LLM call — column names as explicit choices
-        if llm_client and llm_client.is_available():
-            col_list = ", ".join(f'"{c}"' for c in df.columns[:60])
-            prompt = (
-                f"Column names: [{col_list}]\n"
-                "Which ONE column is the prediction target?\n"
-                "Reply with ONLY the exact column name — nothing else."
-            )
-            raw = llm_client._generate(prompt, temperature=0.0, max_tokens=30)
-            import re as _re
-            cleaned = _re.sub(r"<think>.*?</think>", "", raw,
-                              flags=_re.DOTALL).strip().strip('"').strip("'")
-            # Accept only exact column match
-            lower_map = {c.lower(): c for c in df.columns}
-            target = lower_map.get(cleaned.lower(), "")
-            if target:
-                session.target = target
-                kernel.namespace["TARGET"] = target
-                return ToolOutput(
-                    success=True,
-                    text=f"Target selected by LLM: `{target}`",
-                    artifacts={"target": target},
-                )
+        # Priority 1: TASK_SPEC already set by understand_task
+        task_spec = kernel.namespace.get("TASK_SPEC", {})
+        if task_spec and task_spec.get("target_column"):
+            out = _accept(task_spec["target_column"], "from task spec")
+            if out:
+                return out
 
-        return ToolOutput(success=False, text="Could not determine target column.",
-                          error="inference failed")
+        # Infer from task meaning and provenance, never column position or a word list.
+        if llm_client and llm_client.is_available():
+            prompt = (
+                "Identify a supervised target ONLY if supported by the user's task. "
+                "A continuous numeric outcome may have one unique value per row. "
+                "Unlabelled exploration/anomaly detection has no supervised target. "
+                "Do not invent labels. Return JSON {\"target\": null or exact column, "
+                "\"reason\": \"evidence from task\"}.\n" + json.dumps({
+                    "brief": session.brief, "hint": args.get("hint", ""),
+                    "task": task_spec, "columns": {str(c): str(t) for c, t in df.dtypes.items()},
+                    "request": getattr(kernel, "task_instruction", "")}, default=str))
+            try:
+                data = json.loads(llm_client._generate(prompt, temperature=0.0,
+                                  max_tokens=500, json_mode=True))
+                out = _accept(data.get("target"), str(data.get("reason", "")))
+                if out:
+                    return out
+            except Exception:
+                pass
+
+        # Nothing suitable. Every candidate was a date or an identifier, which
+        # means this is very likely an unlabelled task. Fail loudly and steer
+        # the agent to unsupervised methods rather than let it invent a target.
+        detail = "; ".join(rejected) if rejected else "no candidate columns"
+        return ToolOutput(
+            success=False,
+            text=_NO_TARGET_MSG.format(detail=detail),
+            error="no valid target; task appears unlabelled",
+        )
 
 
 class MutualInfoTool(BaseTool):
@@ -548,7 +583,8 @@ class MutualInfoTool(BaseTool):
             # ── Information Gain Ratio (normalise by feature entropy) ────────
             _igr = {{}}
             for _c in _X.columns:
-                _h_feat = mutual_info_classif(_X[[_c]], _X[_c], random_state=0)[0]
+                _p = _X[_c].value_counts(normalize=True)
+                _h_feat = float(-(_p * np.log(_p)).sum())
                 _igr[_c] = _mi_s[_c] / _h_feat if _h_feat > 1e-9 else 0.0
             _igr_s = pd.Series(_igr).sort_values(ascending=False)
 
@@ -623,51 +659,12 @@ class FeatureEngineeringTool(BaseTool):
     }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
-        target = MutualInfoTool._ensure_target(session, kernel, llm_client)
-        if not target:
-            return ToolOutput(success=False, text="Target not set.",
-                              error="no target")
-        top_k = args.get("top_k", 30)
-        code = textwrap.dedent(f"""
-            from sklearn.preprocessing import LabelEncoder
-            import numpy as np
-            _tgt = {repr(target)}
-            _df2 = df.copy()
-            # Remove aggregated proxies of the target (e.g. incident_outcome_mean when target=incident_outcome_binary)
-            _tgt_base = _tgt.rsplit('_', 1)[0] if '_' in _tgt else _tgt
-            _tgt_proxies = [c for c in _df2.columns
-                            if c != _tgt and (c.startswith(_tgt_base + '_') or c == _tgt_base)]
-            if _tgt_proxies:
-                _df2 = _df2.drop(columns=_tgt_proxies)
-                print(f"Dropped {{len(_tgt_proxies)}} target-proxy columns: {{_tgt_proxies[:5]}}")
-            # Encode object columns
-            for col in _df2.select_dtypes('object').columns:
-                if col == _tgt: continue
-                _df2[col] = LabelEncoder().fit_transform(_df2[col].astype(str))
-            # Fill nulls
-            _df2 = _df2.fillna(_df2.median(numeric_only=True))
-            # Interaction pairs for top-5 numeric features
-            _num_cols = [c for c in _df2.select_dtypes('number').columns if c != _tgt][:5]
-            for i, c1 in enumerate(_num_cols):
-                for c2 in _num_cols[i+1:]:
-                    _df2[f'{{c1}}_x_{{c2}}'] = _df2[c1] * _df2[c2]
-            print(f"Features after engineering: {{_df2.shape[1]-1}} (was {{df.shape[1]-1}})")
-            # Feature selection via RF importance
-            from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-            _X = _df2.drop(columns=[_tgt])
-            _y = _df2[_tgt]
-            _is_cls = _y.dtype == object or _y.nunique() < 20
-            _rf = (RandomForestClassifier if _is_cls else RandomForestRegressor)(
-                n_estimators=50, random_state=0, n_jobs=-1)
-            _rf.fit(_X, _y)
-            _imp = pd.Series(_rf.feature_importances_, index=_X.columns)
-            _top = _imp.nlargest({top_k}).index.tolist()
-            df_eng = _df2[_top + [_tgt]]
-            print(f"Selected top-{top_k} features: {{_top[:10]}} …")
-        """).strip()
-        out = kernel.execute(code)
-        return ToolOutput(success=out.success, text=out.as_text(3000),
-                          artifacts={"engineered": True}, error=out.error)
+        if kernel.namespace.get("df") is None:
+            return ToolOutput(False, "", error="Load data first.")
+        kernel.namespace.pop("df_eng", None)
+        return ToolOutput(True, "Feature preprocessing will be fitted inside training folds. "
+                          "Raw predictors and labels are preserved; no global feature selection was fitted.",
+                          artifacts={"preprocessing": "fold-local"})
 
 
 class TrainModelTool(BaseTool):
@@ -704,318 +701,31 @@ class TrainModelTool(BaseTool):
     }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
-        target = MutualInfoTool._ensure_target(session, kernel, llm_client)
-        if not target:
-            return ToolOutput(success=False, text="Target not set.",
-                              error="no target")
-        task_type = args.get("task_type", "auto")
-
-        # ── Read ML_PLAN from data analysis agent (highest priority) ─────────
-        ml_plan: dict = kernel.namespace.get("ML_PLAN", {})
-        _plan_used = False
-        _plan_summary = ""
-        if ml_plan and ml_plan.get("models"):
-            # ML_PLAN produced by MLStrategyAgentTool — use its model list
-            _plan_model_names = [m["name"] for m in ml_plan["models"] if isinstance(m, dict)]
-            models = args.get("models") or _plan_model_names
-            _plan_used = True
-            _plan_summary = (
-                f"Using ML_PLAN from data analysis agent: {_plan_model_names} | "
-                f"rationale: {ml_plan.get('rationale', '')[:120]}"
-            )
-        else:
-            # Fall back to TASK_SPEC recommended models or defaults
-            task_spec = kernel.namespace.get("TASK_SPEC", {})
-            default_models = task_spec.get("recommended_models") or ["rf", "lgbm", "lr"]
-            models = args.get("models") or default_models
-
-        task_spec = kernel.namespace.get("TASK_SPEC", {})
-
-        # Allow caller to override evaluation metric; fall back to ML_PLAN → TASK_SPEC
-        eval_metric = args.get("eval_metric", "auto")
-        if eval_metric == "auto":
-            if ml_plan and ml_plan.get("eval_metric"):
-                eval_metric = ml_plan["eval_metric"]
-            else:
-                spec_metric = task_spec.get("evaluation_metric", "auto")
-                if spec_metric and spec_metric not in ("auto", "?"):
-                    eval_metric = spec_metric
-
-        # Store hyperparams from ML_PLAN so training code can inject them
-        _ml_plan_hyperparams: dict = {}
-        if ml_plan and ml_plan.get("models"):
-            for m in ml_plan["models"]:
-                if isinstance(m, dict) and m.get("name") and m.get("hyperparams"):
-                    _ml_plan_hyperparams[m["name"]] = m["hyperparams"]
-
-        code = textwrap.dedent(f"""
-            from sklearn.ensemble import (RandomForestClassifier, RandomForestRegressor,
-                                          GradientBoostingClassifier, GradientBoostingRegressor,
-                                          ExtraTreesClassifier, ExtraTreesRegressor)
-            from sklearn.linear_model import LogisticRegression, Ridge, ElasticNet, Lasso
-            from sklearn.preprocessing import LabelEncoder, StandardScaler
-            from sklearn.model_selection import (cross_val_score, StratifiedKFold,
-                                                 KFold, train_test_split)
-            from sklearn.metrics import (average_precision_score, roc_auc_score,
-                                         f1_score, mean_squared_error, r2_score,
-                                         mean_absolute_error, classification_report)
-            from sklearn.pipeline import Pipeline
-            from sklearn.impute import SimpleImputer
-            import numpy as np, warnings; warnings.filterwarnings('ignore')
-
-            # Optional boosting libraries
-            try:
-                import lightgbm as _lgb
-                _HAS_LGBM = True
-            except ImportError:
-                _HAS_LGBM = False
-            try:
-                import xgboost as _xgb
-                _HAS_XGB = True
-            except ImportError:
-                _HAS_XGB = False
-
-            _tgt = {repr(target)}
-            _src = df_eng if 'df_eng' in dir() else df
-            _X = _src.drop(columns=[_tgt]).select_dtypes(include='number').fillna(0)
-            _y = _src[_tgt].copy()
-
-            # Drop target-derived leakage columns recorded by AggregateDataTool
-            _leak = LEAKAGE_COLS if 'LEAKAGE_COLS' in dir() else []
-            if _leak:
-                _to_drop = [c for c in _leak if c in _X.columns]
-                if _to_drop:
-                    _X = _X.drop(columns=_to_drop)
-                    print(f"Dropped {{len(_to_drop)}} leakage columns: {{_to_drop[:5]}}")
-
-            _is_cls = {repr(task_type)} == 'classification' or (
-                {repr(task_type)} == 'auto' and (_y.dtype == object or _y.nunique() <= 20))
-            if _y.dtype == object:
-                _le = LabelEncoder()
-                _y = pd.Series(_le.fit_transform(_y.astype(str)), name=_tgt)
-
-            _nan_mask = _y.isna()
-            if _nan_mask.any():
-                print(f"Dropping {{_nan_mask.sum()}} rows with NaN target")
-                _X = _X[~_nan_mask]; _y = _y[~_nan_mask]
-
-            # ── class imbalance ──────────────────────────────────────────────
-            _imbalanced = False; _cw = None; _n_classes = 2
-            if _is_cls:
-                _vc = _y.value_counts()
-                _n_classes = _vc.shape[0]
-                _ratio = _vc.min() / _vc.max()
-                _imbalanced = _ratio < 0.4
-                _cw = 'balanced' if _imbalanced else None
-                print(f"Class distribution: {{_vc.to_dict()}} | n_classes={{_n_classes}} | imbalanced={{_imbalanced}}")
-
-            # ── choose evaluation metric ─────────────────────────────────────
-            _eval_hint = {repr(eval_metric)}
-            if _eval_hint in ('auto', '?', ''):
-                if _is_cls and _n_classes == 2 and _imbalanced:
-                    _metric = 'average_precision'
-                elif _is_cls and _n_classes == 2:
-                    _metric = 'roc_auc'
-                elif _is_cls and _n_classes > 2 and _imbalanced:
-                    _metric = 'f1_weighted'
-                elif _is_cls:
-                    _metric = 'roc_auc_ovr_weighted'
-                else:
-                    _metric = 'neg_root_mean_squared_error'
-            else:
-                _metric = _eval_hint
-
-            # Multiclass overrides — sklearn's binary scorers don't work for >2 classes
-            _explicit_binary = {repr(task_type)} == 'binary_classification'
-            if _is_cls and _n_classes > 2 and not _explicit_binary:
-                if _metric in ('roc_auc',):
-                    _metric = 'roc_auc_ovr_weighted'
-                if _metric in ('pr_auc', 'average_precision'):
-                    _metric = 'f1_weighted'
-            elif _is_cls and _n_classes > 2 and _explicit_binary:
-                # Task declared binary but target still has >2 classes — force-binarize
-                _majority_cls = int(_y.value_counts().index[0])
-                _y = (_y != _majority_cls).astype(int)
-                _n_classes = 2
-                print(f"[binary guard] Forced binarization: majority class {{_majority_cls}} → 0, rest → 1")
-            # pr_auc is not a sklearn scorer name; remap
-            if _metric == 'pr_auc':
-                _metric = 'average_precision'
-
-            print(f"Evaluation metric: {{_metric}}")
-
-            # ── model catalogue ──────────────────────────────────────────────
-            _all = {{}}
-            if _is_cls:
-                _all['rf'] = RandomForestClassifier(n_estimators=200, random_state=0,
-                                                    n_jobs=-1, class_weight=_cw)
-                _all['extra_trees'] = ExtraTreesClassifier(n_estimators=200, random_state=0,
-                                                           n_jobs=-1, class_weight=_cw)
-                _all['gbm'] = GradientBoostingClassifier(n_estimators=200, random_state=0)
-                _all['lr'] = LogisticRegression(max_iter=2000, random_state=0,
-                                                class_weight=_cw)
-                if _HAS_LGBM:
-                    _scale_pos = (_y.value_counts().iloc[0] / _y.value_counts().iloc[-1]
-                                  if _imbalanced and _n_classes == 2 else 1)
-                    _all['lgbm'] = _lgb.LGBMClassifier(n_estimators=300, random_state=0,
-                                                       n_jobs=-1, verbose=-1,
-                                                       scale_pos_weight=_scale_pos if _n_classes==2 else 1,
-                                                       class_weight=_cw if _n_classes > 2 else None)
-                if _HAS_XGB:
-                    _all['xgb'] = _xgb.XGBClassifier(n_estimators=300, random_state=0,
-                                                      n_jobs=-1, verbosity=0,
-                                                      use_label_encoder=False,
-                                                      eval_metric='logloss')
-            else:
-                _all['rf'] = RandomForestRegressor(n_estimators=200, random_state=0, n_jobs=-1)
-                _all['extra_trees'] = ExtraTreesRegressor(n_estimators=200, random_state=0,
-                                                          n_jobs=-1)
-                _all['gbm'] = GradientBoostingRegressor(n_estimators=200, random_state=0)
-                _all['ridge'] = Ridge()
-                _all['elasticnet'] = ElasticNet(max_iter=5000, random_state=0)
-                _all['lasso'] = Lasso(max_iter=5000, random_state=0)
-                if _HAS_LGBM:
-                    _all['lgbm'] = _lgb.LGBMRegressor(n_estimators=300, random_state=0,
-                                                      n_jobs=-1, verbose=-1)
-                if _HAS_XGB:
-                    _all['xgb'] = _xgb.XGBRegressor(n_estimators=300, random_state=0,
-                                                     n_jobs=-1, verbosity=0)
-
-            # ── Apply ML_PLAN hyperparameter hints ───────────────────────────
-            # When DataAnalysisAgentTool ran first, it left specific hyperparams
-            # in ML_PLAN. Override the catalogue defaults here.
-            _plan_hp = {repr(_ml_plan_hyperparams)}
-            if _plan_hp:
-                for _pname, _hp in _plan_hp.items():
-                    if _pname in _all and isinstance(_hp, dict):
-                        try:
-                            _clean_hp = {{k: v for k, v in _hp.items() if v is not None}}
-                            _all[_pname].set_params(**_clean_hp)
-                            print(f"Applied ML_PLAN hyperparams to {{_pname}}: {{_clean_hp}}")
-                        except Exception as _hp_err:
-                            print(f"⚠ Could not apply hyperparams to {{_pname}}: {{_hp_err}}")
-
-            # ── Drop features_to_exclude from ML_PLAN ────────────────────────
-            _plan_exclude = {repr(ml_plan.get("features_to_exclude", []) if ml_plan else [])}
-            if _plan_exclude:
-                _to_drop_plan = [c for c in _plan_exclude if c in _X.columns]
-                if _to_drop_plan:
-                    _X = _X.drop(columns=_to_drop_plan)
-                    print(f"Excluded features from ML_PLAN: {{_to_drop_plan}}")
-
-            _req_models = {repr(models)}
-            _selected = {{k: v for k, v in _all.items() if k in _req_models}}
-            if not _selected:
-                # Requested models not available (e.g. lgbm not installed); fall back
-                _selected = {{k: v for k, v in _all.items() if k in ('rf', 'lr', 'ridge')}}
-                print(f"⚠ Requested models {{_req_models}} not all available. "
-                      f"Using: {{list(_selected.keys())}}")
-
-            # Guard: StratifiedKFold requires >= n_splits samples per class.
-            # Fall back to KFold when any class is too rare to stratify.
-            _n_splits = 5
-            _can_stratify = (
-                _is_cls
-                and _n_classes >= 2
-                and (_vc.min() if _is_cls else 999) >= _n_splits
-            )
-            _cv = (StratifiedKFold(_n_splits, shuffle=True, random_state=0)
-                   if _can_stratify else KFold(_n_splits, shuffle=True, random_state=0))
-            if _is_cls and not _can_stratify:
-                print(f"⚠ Minority class has only {{_vc.min()}} samples — "
-                      f"falling back to KFold (non-stratified) CV")
-            _results = {{}}
-            for _name, _est in _selected.items():
-                _pipe = Pipeline([('imp', SimpleImputer(strategy='median')),
-                                  ('sc', StandardScaler()), ('m', _est)])
-                try:
-                    _s = cross_val_score(_pipe, _X, _y, cv=_cv,
-                                         scoring=_metric, n_jobs=-1)
-                    _results[_name] = _s
-                    print(f"{{_name:12s}} | {{_metric}}: {{_s.mean():.4f}} ± {{_s.std():.4f}}")
-                except Exception as _cv_err:
-                    print(f"{{_name:12s}} | CV failed: {{_cv_err}}")
-
-            if not _results:
-                print("ERROR: no models completed CV successfully")
-            else:
-                # ── fit best model on all data ───────────────────────────────
-                _best_name = max(_results, key=lambda k: _results[k].mean())
-                _best_pipe = Pipeline([('imp', SimpleImputer(strategy='median')),
-                                       ('sc', StandardScaler()),
-                                       ('m', _selected[_best_name])])
-                _best_pipe.fit(_X, _y)
-                best_model = _best_pipe
-                print(f"\\nBest model: {{_best_name}}")
-
-                # ── hold-out evaluation ──────────────────────────────────────
-                # Guard: stratify only when every class has >= 2 samples
-                _min_cls_count = _vc.min() if _is_cls else 999
-                _stratify_arg = _y if (_is_cls and _min_cls_count >= 2) else None
-                _X_tr, _X_te, _y_tr, _y_te = train_test_split(
-                    _X, _y, test_size=0.2, random_state=42,
-                    stratify=_stratify_arg)
-                _best_pipe.fit(_X_tr, _y_tr)
-                _pred = _best_pipe.predict(_X_te)
-
-                if _is_cls:
-                    print("\\n--- Hold-out evaluation ---")
-                    print(classification_report(_y_te, _pred))
-                    if hasattr(_best_pipe, 'predict_proba'):
-                        _proba = _best_pipe.predict_proba(_X_te)
-                        if _n_classes == 2:
-                            _pr_auc = average_precision_score(_y_te, _proba[:, 1])
-                            _roc_auc = roc_auc_score(_y_te, _proba[:, 1])
-                            print(f"PR-AUC  : {{_pr_auc:.4f}}")
-                            print(f"ROC-AUC : {{_roc_auc:.4f}}")
-                            from sklearn.metrics import PrecisionRecallDisplay
-                            PrecisionRecallDisplay.from_predictions(_y_te, _proba[:, 1]).plot()
-                            plt.title(f'Precision-Recall Curve ({{_best_name}})')
-                            plt.tight_layout(); plt.show()
-                        else:
-                            try:
-                                _labels = sorted(_y.unique().tolist())
-                                _auc = roc_auc_score(_y_te, _proba, multi_class='ovr',
-                                                     average='weighted', labels=_labels)
-                                print(f"Weighted OvR ROC-AUC: {{_auc:.4f}}")
-                            except Exception as _auc_err:
-                                print(f"ROC-AUC skipped: {{_auc_err}}")
-                else:
-                    _rmse = mean_squared_error(_y_te, _pred, squared=False)
-                    _mae = mean_absolute_error(_y_te, _pred)
-                    _r2 = r2_score(_y_te, _pred)
-                    print(f"\\n--- Hold-out evaluation ---")
-                    print(f"RMSE : {{_rmse:.4f}}")
-                    print(f"MAE  : {{_mae:.4f}}")
-                    print(f"R²   : {{_r2:.4f}}")
-
-                # ── feature importance ───────────────────────────────────────
-                try:
-                    _m = _best_pipe.named_steps['m']
-                    _imp = pd.Series(_m.feature_importances_, index=_X.columns).nlargest(20)
-                    _imp.plot(kind='barh', figsize=(9, 6), color='coral')
-                    plt.title(f'Top-20 Feature Importances ({{_best_name}})')
-                    plt.tight_layout(); plt.show()
-                    print("\\nTop features:")
-                    print(_imp.round(4).to_string())
-                except Exception: pass
-
-                # ── smoke test ───────────────────────────────────────────────
-                print("\\n=== Smoke Test ===")
-                _smoke = _best_pipe.predict(_X_te[:5])
-                print(f"Predicted : {{_smoke}}")
-                print(f"Actual    : {{_y_te.iloc[:5].values}}")
-                print("Smoke test PASSED ✓")
-        """).strip()
-        out = kernel.execute(code)
-        prefix = f"[ML_PLAN] {_plan_summary}\n\n" if _plan_used and _plan_summary else ""
-        return ToolOutput(
-            success=out.success,
-            text=prefix + out.as_text(4000),
-            figures=out.figures,
-            artifacts={"models_trained": models, "ml_plan_used": _plan_used},
-            error=out.error,
-        )
+        from agent.pipeline.model_builder.supervised import train
+        kernel.namespace.pop("best_model", None)
+        kernel.namespace.pop("TRAINING_RESULT", None)
+        spec = kernel.namespace.get("TASK_SPEC") or {}
+        target = session.target or kernel.namespace.get("TARGET") or spec.get("target_column")
+        task = args.get("task_type", "auto")
+        if task == "auto":
+            task = spec.get("task_type")
+        if not target or task not in {"classification", "binary_classification",
+                                      "multiclass_classification", "regression"}:
+            return ToolOutput(False, "", error="Identify a target and supervised task type first; "
+                              "an unlabelled task must not be converted into supervised training.")
+        models = args.get("models") or spec.get("recommended_models") or ["lgbm", "rf", "lr"]
+        try:
+            result = train(kernel.namespace["df"], target=target, task_type=task,
+                           models=models, leakage=kernel.namespace.get("LEAKAGE_COLS", []),
+                           metric=args.get("eval_metric") or spec.get("evaluation_metric"),
+                           group=spec.get("group_column"), time_column=spec.get("time_column"))
+        except Exception as exc:
+            return ToolOutput(False, "", error=f"Training failed: {exc}")
+        kernel.namespace["best_model"] = result["model"]
+        summary = {k: v for k, v in result.items() if k != "model"}
+        kernel.namespace["TRAINING_RESULT"] = summary
+        return ToolOutput(True, json.dumps(summary, indent=2), artifacts=summary,
+                          math_trace=result["math_trace"])
 
 
 class VisualizeTool(BaseTool):
@@ -1320,11 +1030,23 @@ class VisualizeTool(BaseTool):
 class ExecuteCodeTool(BaseTool):
     name = "execute_code"
     description = (
-        "Execute arbitrary Python code in the persistent kernel. Use this for any "
-        "custom analysis, transformation, modelling, or visualization not covered by "
-        "other tools. The kernel retains all variables between calls. "
-        "Use WORK_DIR (a Path) to save any files (models, CSVs, plots) to the "
-        "working directory set by the user."
+        "Run Python in an isolated sandbox for custom analysis, transformation, "
+        "or visualization not covered by other tools. Loaded data is available "
+        "by name (e.g. df). Each call runs fresh: pandas DataFrames and Series "
+        "you create are kept and can be reused by name in later calls. New "
+        "columns you add to the loaded data (df, df2, ...) are kept too, but "
+        "any other change to it (dropping, filtering or overwriting values) is "
+        "discarded; keep such versions under a new name (e.g. claims = "
+        "df[df.paid_amount > 0]). Other "
+        "objects (models, dicts, numbers) are not, so recompute or print what "
+        "you need. Available: pandas, numpy, scipy, scikit-learn (e.g. "
+        "IsolationForest, DBSCAN), matplotlib, seaborn; shap, xgboost, "
+        "lightgbm and statsmodels are NOT installed. Print every figure you "
+        "will cite. matplotlib plots are shown to the user automatically, but "
+        "you cannot see them: only printed text comes back to you, so state "
+        "findings from printed numbers, never from how a chart looks. To "
+        "propose saving a file, write it under WORK_DIR; it is only published "
+        "to the user's folder after they approve it. No network access."
     )
     input_schema = {
         "type": "object",
@@ -1335,12 +1057,26 @@ class ExecuteCodeTool(BaseTool):
     }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
+        from agent.api.sandbox import execute
         code = args.get("code", "")
-        if not code.strip():
-            return ToolOutput(success=False, text="No code provided.", error="empty code")
-        out = kernel.execute(code)
-        return ToolOutput(success=out.success, text=out.as_text(4000),
-                          figures=out.figures, error=out.error)
+        try:
+            out = execute(code, session=session, kernel=kernel)
+        except Exception as exc:
+            return ToolOutput(False, "", error=f"Isolated execution failed: {exc}")
+        if out.success:
+            # Record the step so the session's analysis can be exported as a
+            # notebook or script later (build_notebook).
+            cells = getattr(kernel, "analysis_cells", None)
+            if not isinstance(cells, list):
+                cells = []
+                try:
+                    kernel.analysis_cells = cells
+                except Exception:  # noqa: BLE001
+                    return out
+            cells.append({"code": code, "output": (out.text or "")[:3000],
+                          "figures": len(out.figures or []),
+                          "finding": "", "answers": []})
+        return out
 
 
 class UnderstandTaskTool(BaseTool):
@@ -1442,19 +1178,34 @@ class UnderstandTaskTool(BaseTool):
         raw_spec = None
         if llm_client and llm_client.is_available():
             from agent.api.llm import SCOPE_MODEL  # noqa: PLC0415
+            from agent.api.task_extractor import read_brief  # noqa: PLC0415
             extractor = TaskExtractor(
                 ollama_base_url=llm_client.host,
                 model=llm_client.model,
                 timeout=llm_client._timeout,
                 scope_model=SCOPE_MODEL,
             )
-            raw_spec = extractor.extract(doc, df_stats, col_names, user_hint=user_hint)
+            # One call that keeps the brief's own questions and deliverables.
+            # The decomposed extraction is the fallback when that reply is
+            # unusable.
+            raw_spec = read_brief(llm_client, brief, df_stats, col_names)
+            if raw_spec is not None and df_stats.get("secondary_data_files"):
+                roles = extractor._call_file_roles(doc, df_stats, user_hint)
+                question = roles.pop("clarification_needed", None)
+                if question:
+                    raw_spec.clarification_needed = question
+                else:
+                    raw_spec.file_role_map = {
+                        var: info.get("role", "unknown")
+                        for var, info in roles.items() if isinstance(info, dict)}
+            if raw_spec is None:
+                raw_spec = extractor.extract(doc, df_stats, col_names, user_hint=user_hint)
 
         # ── Clarification early return ────────────────────────────────
         # If file-role reasoning couldn't assign roles confidently, surface
         # the clarification question and wait for a user reply before continuing.
         from agent.api.task_extractor import RawSpec  # noqa: PLC0415
-        if raw_spec is not None and getattr(raw_spec, "clarification_needed", ""):
+        if raw_spec is not None and getattr(raw_spec, "clarification_needed", False):
             kernel.namespace["FILE_ROLE_CLARIFICATION"] = {
                 "clarification_pending": True,
                 "question": raw_spec.clarification_needed,
@@ -1498,6 +1249,9 @@ class UnderstandTaskTool(BaseTool):
             "validation_failures":    failures,
             # Specific requirements extracted verbatim from the brief
             "specific_requirements":  getattr(raw_spec, "specific_requirements", []),
+            # The brief in its own terms: objective, questions, deliverables,
+            # audiences, constraints, data notes, open questions
+            "brief":                  getattr(raw_spec, "brief", {}) or {},
             # True when instructions indicate the target variable needs a second file
             "requires_secondary_file": getattr(raw_spec, "requires_secondary_file", False),
             # File-role map (populated when multiple files loaded)
@@ -1544,8 +1298,19 @@ class UnderstandTaskTool(BaseTool):
             lines.append(f"Imbalance : {enriched.class_imbalance_ratio:.3f}")
         if enriched.enrichment_notes:
             lines.append("Notes     : " + "; ".join(enriched.enrichment_notes))
+        brief_model = getattr(raw_spec, "brief", {}) or {}
         reqs = getattr(raw_spec, "specific_requirements", [])
-        if reqs:
+        if brief_model:
+            for label, key in (("Questions the brief asks", "questions"),
+                               ("Deliverables", "deliverables"),
+                               ("Audiences", "audiences"),
+                               ("Constraints", "constraints"),
+                               ("Open questions", "open_questions")):
+                items = brief_model.get(key) or []
+                if items:
+                    lines.append(f"{label}:")
+                    lines.extend(f"  {i}. {x}" for i, x in enumerate(items[:12], 1))
+        elif reqs:
             lines.append("Requirements:")
             lines.extend(f"  • {r}" for r in reqs[:10])
         # File roles section
@@ -1924,68 +1689,171 @@ class AggregateDataTool(BaseTool):
 class BuildNotebookTool(BaseTool):
     name = "build_notebook"
     description = (
-        "Build a complete, runnable Jupyter notebook (.ipynb) with all findings: "
-        "EDA, quality, feature importance, model comparison, evaluation, drift, "
-        "and deployment snippets. Saves to WORK_DIR if set. Run this as the FINAL step."
+        "Export the analysis done in this session as a runnable Jupyter notebook "
+        "(format='ipynb') or Python script (format='py'): the brief's questions, "
+        "the plan, every successful execute_code step in order with the finding "
+        "it produced, and a summary of the EDA agenda. The code is re-run in the "
+        "sandbox from the source data first to check it executes. The file is a "
+        "proposal that the user approves before it is written."
     )
-    input_schema = {"type": "object", "properties": {}, "required": []}
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "format": {"type": "string", "enum": ["ipynb", "py"],
+                       "description": "ipynb for a notebook, py for a script "
+                                      "(default ipynb)"},
+            "path": {"type": "string",
+                     "description": "File name in the working directory, "
+                                    "e.g. analysis.ipynb"},
+        },
+    }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
-        import tempfile
+        root = _ws_root(session, kernel)
+        if root is None:
+            return ToolOutput(False, "", error="Set a working directory first; "
+                              "the file is proposed there.")
+        cells = getattr(kernel, "analysis_cells", None) or []
+        if not cells:
+            return ToolOutput(False, "", error=(
+                "No analysis has run in this session yet, so there is nothing to "
+                "export. Run the analysis (execute_code) first."))
+        path = str(args.get("path") or "").strip()
+        fmt = str(args.get("format") or "").strip().lower().lstrip(".")
+        if not fmt:
+            fmt = "py" if path.endswith(".py") else "ipynb"
+        if fmt not in ("ipynb", "py"):
+            return ToolOutput(False, "", error="format must be 'ipynb' or 'py'.")
+        path = path or f"analysis.{fmt}"
+        if not path.endswith(f".{fmt}"):
+            path = f"{Path(path).stem}.{fmt}"
 
-        from agent.api import orchestrator
-        from agent.pipeline.evaluator.leaderboard import Leaderboard
-        # Ensure work_dir is propagated from kernel namespace if set there
-        if session.work_dir is None:
-            wd = kernel.namespace.get("WORK_DIR")
-            if wd is not None:
-                session.work_dir = Path(str(wd))
+        sections = _export_sections(session, kernel, cells, root)
+        check = _verify_export(cells, session=session, kernel=kernel)
+        if check:
+            sections.insert(1, ("md", "> **Check failed:** re-running these cells in "
+                                      f"the sandbox stopped with: `{check}`. "
+                                      "Review before relying on this file."))
+        content = _as_notebook(sections) if fmt == "ipynb" else _as_script(sections)
+        out = WriteFileTool().execute({"path": path, "content": content, "overwrite": True},
+                                      session=session, kernel=kernel, llm_client=llm_client)
+        status = (f"Re-run check failed: {check}" if check else
+                  "Re-run check passed: every cell executed from the source data.")
+        return ToolOutput(out.success,
+                          f"Exported {len(cells)} analysis step(s) as {path}. {status}\n"
+                          + (out.text or ""),
+                          error=out.error,
+                          artifacts={"export": path, "verified": not check})
 
-        # If the kernel df has been transformed (e.g. post-aggregation) and the
-        # current session.target no longer exists in the original data file,
-        # save the kernel df to a temp CSV so the orchestrator sees the right data.
-        _target = session.target
-        _kernel_df = kernel.namespace.get("df")
-        _orig_data_path = session.data_path
-        _swapped_path = False
-        if (_target and _kernel_df is not None
-                and _target in _kernel_df.columns
-                and session.data_path is not None):
-            try:
-                import pandas as _pd
-                _raw = _pd.read_csv(session.data_path, nrows=1)
-                if _target not in _raw.columns:
-                    _tmp = tempfile.NamedTemporaryFile(
-                        suffix=".csv", delete=False,
-                        dir=str(session.work_dir or Path(session.data_path).parent),
-                        prefix="agg_snapshot_",
-                    )
-                    _kernel_df.to_csv(_tmp.name, index=False)
-                    session.data_path = Path(_tmp.name)
-                    _swapped_path = True
-            except Exception:
-                pass  # fall through — orchestrator will surface its own error
 
+def _data_loader_lines(session, root: Path) -> list[str]:
+    """Code that loads the session's data files under the names the analysis
+    used (df, df2, ...), with paths relative to the working directory."""
+    readers = {".csv": "pd.read_csv", ".parquet": "pd.read_parquet",
+               ".xlsx": "pd.read_excel", ".xls": "pd.read_excel",
+               ".json": "pd.read_json", ".tsv": "pd.read_csv"}
+    lines = []
+    for i, p in enumerate(getattr(session, "data_paths", []) or [], start=1):
+        var = "df" if i == 1 else f"df{i}"
+        p = Path(p)
         try:
-            result = orchestrator.run_full_pipeline(
-                session,
-                leaderboard=Leaderboard(),
-                llm_client=llm_client,
-            )
-            if result.get("notebook"):
-                session.notebook_path = Path(result["notebook"])
-            return ToolOutput(
-                success="error" not in result,
-                text=result.get("reply", "Notebook built."),
-                artifacts={"notebook": result.get("notebook"),
-                           "metrics": result.get("metrics", {})},
-                error=result.get("error", ""),
-            )
-        except Exception:
-            return ToolOutput(success=False, text="", error=traceback.format_exc(4))
-        finally:
-            if _swapped_path:
-                session.data_path = _orig_data_path
+            shown = str(p.resolve().relative_to(root.resolve()))
+        except ValueError:
+            shown = str(p)
+        reader = readers.get(p.suffix.lower())
+        extra = ', sep="\\t"' if p.suffix.lower() == ".tsv" else ""
+        lines.append(f"{var} = {reader}({shown!r}{extra})" if reader
+                     else f"# {var}: load {shown} here")
+    return lines or ["# df = pd.read_csv('your_data.csv')"]
+
+
+def _export_sections(session, kernel, cells: list[dict], root: Path) -> list[tuple[str, str]]:
+    """Markdown and code sections for an export, in reading order."""
+    ns = kernel.namespace
+    raw_spec = ns.get("TASK_SPEC")
+    spec: dict = raw_spec if isinstance(raw_spec, dict) else {}
+    raw_brief = spec.get("brief")
+    brief: dict = raw_brief if isinstance(raw_brief, dict) else {}
+    raw_agenda = ns.get("EDA_AGENDA")
+    agenda: list = raw_agenda if isinstance(raw_agenda, list) else []
+    by_id = {a.get("id"): a for a in agenda}
+    title = brief.get("objective") or spec.get("task_description") or "Data analysis"
+    out: list[tuple[str, str]] = [("md", f"# Analysis\n\n{title}")]
+    if brief.get("questions"):
+        out.append(("md", "## Questions from the brief\n\n" + "\n".join(
+            f"{i}. {q}" for i, q in enumerate(brief["questions"], 1))))
+    plan = ns.get("WORK_PLAN")
+    if isinstance(plan, dict):
+        md = _plan_to_markdown(plan, spec)
+        out.append(("md", "## Plan\n\n" + (md.split("\n", 1)[1].lstrip()
+                                          if md.startswith("# ") else md)))
+    out.append(("md", "## Setup"))
+    out.append(("code", "\n".join([
+        "import numpy as np", "import pandas as pd", "import matplotlib.pyplot as plt",
+        "import seaborn as sns", "from pathlib import Path", "",
+        "pd.set_option('display.max_columns', 50)",
+        "WORK_DIR = Path('.')", *_data_loader_lines(session, root)])))
+    for i, cell in enumerate(cells, 1):
+        head = [f"## Step {i}"]
+        for qid in cell.get("answers") or []:
+            if qid in by_id:
+                head.append(f"Answers [{qid}]: {by_id[qid].get('question', '')}")
+        if cell.get("finding"):
+            head.append(f"Finding: {cell['finding']}")
+        out.append(("md", "\n\n".join(head)))
+        out.append(("code", str(cell.get("code", "")).strip()))
+    if agenda:
+        answered = [a for a in agenda if a.get("status") == "answered"]
+        still = [a for a in agenda if a.get("status") != "answered"]
+        lines = ["## Summary of findings", ""]
+        lines += [f"- [{a['id']}] {a['question']}: {a.get('finding', '')}" for a in answered]
+        if still:
+            lines += ["", "Not yet answered:"] + [f"- [{a['id']}] {a['question']}" for a in still]
+        out.append(("md", "\n".join(lines)))
+    return out
+
+
+def _verify_export(cells: list[dict], *, session, kernel) -> str:
+    """Re-run the exported cells in the sandbox from the source data only.
+    Returns "" when they all execute, otherwise the error headline."""
+    from agent.api.sandbox import execute as sandbox_execute
+    code = "\n\n".join(["import seaborn as sns"]
+                       + [str(c.get("code", "")) for c in cells])
+    try:
+        res = sandbox_execute(code, session=session, kernel=kernel, dry_run=True)
+    except Exception as exc:  # noqa: BLE001
+        return f"could not run the check: {exc}"
+    if res.success:
+        return ""
+    lines = [ln for ln in (res.error or "").strip().splitlines() if ln.strip()]
+    return (lines[-1] if lines else "unknown error")[:300]
+
+
+def _as_notebook(sections: list[tuple[str, str]]) -> str:
+    cells: list[dict] = []
+    for kind, text in sections:
+        if kind == "md":
+            cells.append({"cell_type": "markdown", "metadata": {}, "source": text})
+        else:
+            cells.append({"cell_type": "code", "metadata": {}, "execution_count": None,
+                          "outputs": [], "source": text})
+    return json.dumps({"nbformat": 4, "nbformat_minor": 5,
+                       "metadata": {"kernelspec": {"name": "python3", "language": "python",
+                                                   "display_name": "Python 3"}},
+                       "cells": cells}, indent=1)
+
+
+def _as_script(sections: list[tuple[str, str]]) -> str:
+    """Percent-format script: runs as plain Python, opens as cells in VS Code
+    and Jupytext."""
+    parts = []
+    for kind, text in sections:
+        if kind == "md":
+            parts.append("# %% [markdown]\n" + "\n".join(
+                f"# {ln}" if ln else "#" for ln in text.splitlines()))
+        else:
+            parts.append("# %%\n" + text)
+    return "\n\n".join(parts) + "\n"
 
 
 class ReadInstructionsTool(BaseTool):
@@ -1998,15 +1866,42 @@ class ReadInstructionsTool(BaseTool):
         "type": "object",
         "properties": {
             "path": {"type": "string",
-                     "description": "Absolute path to the instructions document"},
+                     "description": "Path to the document. A bare filename is "
+                                    "resolved inside the working directory."},
         },
         "required": ["path"],
     }
 
     def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
-        p = Path(args.get("path", "")).expanduser().resolve()
-        if not p.exists():
-            return ToolOutput(success=False, text="", error=f"File not found: {p}")
+        rel = (args.get("path") or "").strip()
+        if not rel:
+            return ToolOutput(success=False, text="",
+                              error="read_instructions needs a 'path'.")
+        # Resolve inside the working directory first. Every other file tool does
+        # this via _ws_resolve_within; this one resolved against the process
+        # working directory instead, so a bare filename pointed at wherever the
+        # server happened to be started from and always failed.
+        root = _ws_root(session, kernel)
+        p = None
+        if root is not None:
+            cand = _ws_resolve_within(root, rel)
+            if cand is not None and cand.is_file():
+                p = cand
+        if p is None:
+            cand = Path(rel).expanduser().resolve()
+            if cand.is_file():
+                p = cand
+        if p is None:
+            hint = ""
+            if root is not None:
+                docs = sorted(f.name for f in root.iterdir()
+                              if f.is_file()
+                              and f.suffix.lower() in {".pdf", ".md", ".txt", ".rst"})
+                if docs:
+                    hint = (" Documents in the working directory: "
+                            + ", ".join(repr(d) for d in docs[:8]) + ".")
+            return ToolOutput(success=False, text="",
+                              error=f"File not found: {rel!r}.{hint}")
         try:
             if p.suffix.lower() == ".pdf":
                 from agent.api.pdf_reader import extract
@@ -2261,8 +2156,9 @@ class ConnectDataTool(BaseTool):
         "Connect to an EXTERNAL data source and load a query result or table "
         "into the session as `df`. Sources: sqlite, flatfile/csv, postgres, "
         "mysql, bigquery, snowflake, mongodb, redis, kafka, azure_sql, rest. "
-        "Provide `source`, a `config` dict of connection settings (e.g. path, "
-        "host, database, user, password), and either a `query` or a `table`. "
+        "Provide `source`, a `config` dict of non-secret connection settings "
+        "(e.g. path, host, database, user; passwords come from environment "
+        "variables), and either a `query` or a `table`. "
         "With neither, lists the available tables for discovery. Read-only."
     )
     input_schema = {
@@ -2287,7 +2183,8 @@ class ConnectDataTool(BaseTool):
         import importlib
 
         source = (args.get("source") or "").lower().strip()
-        cfg = args.get("config") or {}
+        cfg = {k: v for k, v in (args.get("config") or {}).items()
+               if not _SECRET_KEY.search(str(k))}   # secrets come from env vars
         query = (args.get("query") or "").strip()
         table = (args.get("table") or "").strip()
 
@@ -2546,10 +2443,19 @@ def _ws_root(session, kernel) -> Path | None:
     return None
 
 
+def _ws_rel(root: Path, p: Path) -> str:
+    """`p` as a workspace-relative path for messages, absolute if it is outside."""
+    try:
+        return str(p.relative_to(root)) or "."
+    except ValueError:
+        return str(p)
+
+
 def _ws_resolve_within(root: Path, rel: str) -> Path | None:
     """Resolve `rel` against `root` and confine it to the tree. None if it
     escapes (path traversal guard)."""
     try:
+        root = root.expanduser().resolve()
         cand = Path(rel).expanduser()
         target = (cand if cand.is_absolute() else root / cand).resolve()
         if target == root or root in target.parents:
@@ -2707,14 +2613,176 @@ class ReadFileTool(BaseTool):
 # the user enables writes (the web-UI toggle, or DSAGENT_ALLOW_WRITES=1).
 _ALLOW_WRITES_DEFAULT = os.environ.get("DSAGENT_ALLOW_WRITES", "0") != "0"
 
+# The three write modes:
+#   suggest  propose a diff and stop. Nothing is recorded, nothing is written.
+#   ask      stage the change and wait for the user to approve it. This is what
+#            the web-UI WRITES toggle turns on, so enabling writes means "you
+#            may propose changes to disk", not "you may change my files".
+#   write    apply immediately. For automation and tests only; a person driving
+#            the agent through the UI never selects it.
+_WRITE_MODES = ("suggest", "ask", "write")
+
 
 def _ws_write_mode(kernel) -> str:
-    """'write' or 'suggest'. Per-request FILE_WRITE_MODE in the kernel wins;
-    otherwise the DSAGENT_ALLOW_WRITES default applies."""
+    """One of _WRITE_MODES. Per-request FILE_WRITE_MODE in the kernel wins;
+    otherwise the DSAGENT_ALLOW_WRITES default applies. The default for enabled
+    writes is 'ask', never 'write', so a stray env var cannot silently grant
+    unattended write access."""
     m = kernel.namespace.get("FILE_WRITE_MODE") if kernel is not None else None
-    if m in ("write", "suggest"):
+    if m in _WRITE_MODES:
         return m
-    return "write" if _ALLOW_WRITES_DEFAULT else "suggest"
+    return "ask" if _ALLOW_WRITES_DEFAULT else "suggest"
+
+
+# ── pending disk changes ─────────────────────────────────────────────────────
+#
+# A tool that wants to change the workspace stages the change here and reports
+# that it is waiting. The user approves or rejects each one, and only then does
+# it land. Creating a directory is part of the record, so "this also creates
+# outputs/" is something the user reads before it happens rather than discovers
+# afterwards.
+
+def _pending_list(kernel) -> list[dict]:
+    """The session's queue of staged changes, created on first use."""
+    if kernel is None:
+        return []
+    q = getattr(kernel, "pending_changes", None)
+    if not isinstance(q, list):
+        q = []
+        kernel.pending_changes = q
+    return q
+
+
+def _file_hash(path: Path) -> str | None:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def _stage_change(kernel, *, kind: str, rel: str, path: Path, summary: str,
+                  diff: str = "", content: str | None = None,
+                  make_dirs: list[str] | None = None,
+                  extra: dict | None = None) -> dict:
+    """Record a disk change for approval and return it. Touches nothing."""
+    import secrets
+    import time
+    q = _pending_list(kernel)
+    rec = {
+        "id": f"chg_{secrets.token_hex(4)}",
+        "kind": kind,
+        "rel": rel,
+        "path": str(path),
+        "summary": summary,
+        "diff": diff[:8000],
+        "content": content,
+        "base_hash": _file_hash(path),
+        "root": str(path.parent.resolve()),
+        "make_dirs": [str(d) for d in (make_dirs or [])],
+        "extra": extra or {},
+        "staged_at": time.time(),
+    }
+    q.append(rec)
+    return rec
+
+
+def _hold_for_approval(kernel, *, kind: str, rel: str, path: Path, verb: str,
+                       content: str | None = None, diff: str = "",
+                       make_dirs: list[str] | None = None,
+                       extra: dict | None = None) -> ToolOutput | None:
+    """Stage the change and return the tool's reply, or None when the caller
+    should go ahead and write (mode 'write'). Callers handle 'suggest' first."""
+    if _ws_write_mode(kernel) != "ask":
+        return None
+    dirs = [str(d) for d in (make_dirs or [])]
+    summary = verb + (f", creating {len(dirs)} new folder"
+                      f"{'' if len(dirs) == 1 else 's'}" if dirs else "")
+    rec = _stage_change(kernel, kind=kind, rel=rel, path=path, summary=summary,
+                        diff=diff, content=content, make_dirs=dirs, extra=extra)
+    body = (f"\n\n{diff[:3000]}" if diff else "")
+    return ToolOutput(
+        success=True,
+        text=f"AWAITING YOUR APPROVAL: {summary}. Nothing has been written. "
+             f"Approve or reject it in the Pending changes panel "
+             f"(id {rec['id']}).{body}",
+        artifacts={"pending": rec["id"], "path": str(path), "op": verb})
+
+
+def pending_changes(kernel) -> list[dict]:
+    """What is waiting for approval, without the full file contents."""
+    return [{k: v for k, v in rec.items() if k not in {"content", "binary"}}
+            for rec in _pending_list(kernel)]
+
+
+def _apply_one(rec: dict, *, session, kernel) -> None:
+    """Perform one approved change. Raises on failure."""
+    root = _ws_root(session, kernel)
+    path = Path(rec["path"])
+    if root is None or not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Approved destination escapes the workspace")
+    if _file_hash(path) != rec.get("base_hash"):
+        raise ValueError("File changed since the proposed diff; regenerate the proposal")
+    for d in rec.get("make_dirs") or []:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    kind = rec.get("kind")
+    if kind == "file":
+        import base64
+        import tempfile
+        data = (base64.b64decode(rec["binary"]) if "binary" in rec
+                else (rec.get("content") or "").encode())
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+            tmp.write(data)
+        os.replace(tmp.name, path)
+        return
+    if kind == "tool":
+        # Re-run the tool that staged this, with writes applied. The kernel is
+        # the same one, so the model and data it needs are still there.
+        name = (rec.get("extra") or {}).get("tool", "")
+        tool = TOOL_REGISTRY.get(name)
+        if tool is None:
+            raise ValueError(f"unknown tool in staged change: {name!r}")
+        saved = kernel.namespace.get("FILE_WRITE_MODE")
+        kernel.namespace["FILE_WRITE_MODE"] = "write"
+        try:
+            out = tool.execute((rec.get("extra") or {}).get("args") or {},
+                               session=session, kernel=kernel, llm_client=None)
+        finally:
+            kernel.namespace["FILE_WRITE_MODE"] = saved
+        if not out.success:
+            raise RuntimeError(out.error or f"{name} failed")
+        return
+    raise ValueError(f"unknown change kind: {kind!r}")
+
+
+def apply_pending(kernel, ids: list[str] | None = None, *,
+                  session=None) -> dict[str, Any]:
+    """Apply approved changes. `ids` selects a subset; None applies all."""
+    wanted = set(ids) if ids is not None else None
+    applied: list[dict] = []
+    failed: list[dict] = []
+    kept: list[dict] = []
+    for rec in list(_pending_list(kernel)):
+        if wanted is not None and rec["id"] not in wanted:
+            kept.append(rec)
+            continue
+        try:
+            _apply_one(rec, session=session, kernel=kernel)
+            applied.append({"id": rec["id"], "rel": rec["rel"],
+                            "summary": rec["summary"]})
+        except Exception as exc:  # noqa: BLE001
+            kept.append(rec)
+            failed.append({"id": rec["id"], "rel": rec["rel"],
+                           "error": str(exc)})
+    kernel.pending_changes = kept
+    return {"applied": applied, "failed": failed, "pending": len(kept)}
+
+
+def discard_pending(kernel, ids: list[str] | None = None) -> dict[str, Any]:
+    """Drop staged changes without touching disk."""
+    wanted = set(ids) if ids is not None else None
+    kept = [r for r in _pending_list(kernel)
+            if wanted is not None and r["id"] not in wanted]
+    dropped = len(_pending_list(kernel)) - len(kept)
+    kernel.pending_changes = kept
+    return {"discarded": dropped, "pending": len(kept)}
 
 
 def _unified_diff(old: str, new: str, path: str) -> str:
@@ -2855,6 +2923,11 @@ class WriteFileTool(BaseTool):
             "overwrite": {"type": "boolean",
                           "description": "Replace the file if it already exists "
                           "(default false)"},
+            "create_dirs": {"type": "boolean",
+                            "description": "Create missing parent folders "
+                            "(default false). Set this ONLY when the user asked "
+                            "for a new folder. Otherwise a missing folder means "
+                            "the path is wrong."},
         },
         "required": ["path", "content"],
     }
@@ -2883,6 +2956,19 @@ class WriteFileTool(BaseTool):
                 error=f"{rel} already exists — pass overwrite=true to replace it "
                       "(or use edit_file for a targeted change).")
 
+        # A missing parent folder is almost always a wrong path, not a request
+        # for a new folder. Creating it silently is how the agent ends up
+        # building a directory tree nobody asked for.
+        make_dirs: list[str] = []
+        if not target.parent.is_dir():
+            if not args.get("create_dirs", False):
+                return ToolOutput(
+                    success=False, text="",
+                    error=f"Folder does not exist: {_ws_rel(root, target.parent)}"
+                          f". Check the path. Only if the user asked for a new "
+                          "folder, call again with create_dirs=true.")
+            make_dirs = [str(target.parent)]
+
         old = target.read_text(errors="replace") if exists else ""
         diff = _unified_diff(old, content, rel)
         mode = _ws_write_mode(kernel)
@@ -2894,6 +2980,11 @@ class WriteFileTool(BaseTool):
                 text=f"PROPOSED {verb} of {rel} (writes are OFF — nothing "
                      f"written). Enable writes to apply.\n\n{body[:4000]}",
                 artifacts={"proposed": True, "path": str(target), "op": verb})
+        held = _hold_for_approval(kernel, kind="file", rel=rel, path=target,
+                                  verb=f"{verb} {rel}", content=content,
+                                  diff=diff, make_dirs=make_dirs)
+        if held is not None:
+            return held
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
@@ -2985,6 +3076,12 @@ class EditFileTool(BaseTool):
                      f"{diff[:4000]}",
                 artifacts={"proposed": True, "path": str(target),
                            "replacements": n})
+        held = _hold_for_approval(
+            kernel, kind="file", rel=rel, path=target,
+            verb=f"edit {rel} ({n} replacement(s))",
+            content=new_content, diff=diff)
+        if held is not None:
+            return held
         try:
             target.write_text(new_content)
         except OSError as exc:
@@ -3003,6 +3100,9 @@ _SQL_GEN_PROMPT = (
     "answers the question. Use only the tables and columns in the schema. Return "
     "the SQL only, no prose, no code fences.\n\n"
     "SCHEMA:\n{schema}\n\nQUESTION: {question}\n\nSQL:")
+
+_SECRET_KEY = __import__("re").compile(
+    r"pass|secret|token|private_key|credential|api_key", __import__("re").IGNORECASE)
 
 _SQL_FORBIDDEN = __import__("re").compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|MERGE|GRANT|"
@@ -3046,8 +3146,10 @@ class SqlQueryTool(BaseTool):
                        "description": "Connector: snowflake, postgres, bigquery, "
                        "mysql, sqlite, azure_sql"},
             "config": {"type": "object",
-                       "description": "Connection settings (host, database, "
-                       "user, password, path, …)"},
+                       "description": "Non-secret connection settings (account, "
+                       "warehouse, database, schema, path). Passwords and keys "
+                       "come from environment variables such as "
+                       "SNOWFLAKE_PASSWORD, never from here."},
             "question": {"type": "string",
                          "description": "Natural-language question to turn into SQL"},
             "sql": {"type": "string",
@@ -3070,7 +3172,11 @@ class SqlQueryTool(BaseTool):
                 success=False, text="",
                 error=f"sql_query supports SQL sources only: "
                       f"{', '.join(sorted(_SQL_SOURCES))}.")
-        cfg = args.get("config") or {}
+        # Secrets never travel through model-written arguments: they would sit
+        # in the prompt, the transcript and the logs. Connectors read them from
+        # environment variables (SNOWFLAKE_PASSWORD, POSTGRES_PASSWORD, ...).
+        cfg = {k: v for k, v in (args.get("config") or {}).items()
+               if not _SECRET_KEY.search(str(k))}
         question = (args.get("question") or "").strip()
         sql = (args.get("sql") or "").strip()
         if not question and not sql:
@@ -3151,12 +3257,176 @@ class SqlQueryTool(BaseTool):
         if _ws_write_mode(kernel) == "suggest":
             return (f"\n(Would save the SQL to {save_to} — writes are OFF, "
                     "nothing written.)")
+        if not target.parent.is_dir():
+            return (f"\n(Not saved: folder does not exist: "
+                    f"{_ws_rel(root, target.parent)}.)")
+        held = _hold_for_approval(kernel, kind="file", rel=save_to, path=target,
+                                  verb=f"save SQL to {save_to}",
+                                  content=sql + "\n")
+        if held is not None:
+            return (f"\n(Awaiting your approval to save the SQL to {save_to}; "
+                    "nothing written.)")
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(sql + "\n")
             return f"\n(Saved SQL to {save_to}.)"
         except OSError as exc:
             return f"\n(Save failed: {exc}.)"
+
+
+# ── SQL authoring from the loaded data (no warehouse connection needed) ───────
+
+_SQL_DIALECTS = ("snowflake", "postgres", "bigquery", "mysql", "sqlite", "tsql")
+
+_SQL_WRITE_PROMPT = """\
+Write one {dialect} SQL query that answers the request. Use only the tables and
+columns below, with their exact names. Prefer clear CTEs over nested
+subqueries, and comment any step that is not obvious with a -- line.
+Return the SQL only, no prose and no code fences.
+
+TABLES:
+{schema}
+
+WHAT THE COLUMNS MEAN:
+{notes}
+
+REQUEST: {question}
+"""
+
+
+def _sql_type(dtype) -> str:
+    kind = getattr(dtype, "kind", "O")
+    return {"i": "INTEGER", "u": "INTEGER", "f": "DOUBLE", "b": "BOOLEAN",
+            "M": "TIMESTAMP"}.get(kind, "VARCHAR")
+
+
+def _sql_tables(session, kernel, primary: str = "") -> dict[str, Any]:
+    """The session's frames under table names: the data file's stem, so the SQL
+    reads like it targets the real table (df -> medical_claims_dataset)."""
+    import re as _re
+    ns = kernel.namespace
+    paths = list(getattr(session, "data_paths", []) or [])
+    tables: dict[str, Any] = {}
+    for i in range(1, 10):
+        var = "df" if i == 1 else f"df{i}"
+        frame = ns.get(var)
+        if frame is None or not hasattr(frame, "columns"):
+            continue
+        if i == 1 and primary:
+            name = primary
+        elif i - 1 < len(paths):
+            name = Path(paths[i - 1]).stem
+        else:
+            name = var
+        name = _re.sub(r"\W+", "_", name).strip("_").lower() or var
+        tables[name] = frame
+    return tables
+
+
+class WriteSqlTool(BaseTool):
+    name = "write_sql"
+    description = (
+        "Write a SQL query (Snowflake by default; also postgres, bigquery, mysql, "
+        "sqlite, tsql) against the data loaded in this session, without a "
+        "warehouse connection. The loaded files become tables named after the "
+        "file. The query is test-run on the local data with SQLite and the "
+        "result rows are shown; syntax SQLite does not support is reported as "
+        "untested, never as passed. Optionally save_to a .sql file (the user "
+        "approves the write). To run SQL on a live database, use sql_query."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string",
+                         "description": "What the query should compute"},
+            "dialect": {"type": "string", "enum": list(_SQL_DIALECTS),
+                        "description": "Target SQL dialect (default snowflake)"},
+            "table": {"type": "string",
+                      "description": "Table name to use for the main dataset, "
+                                     "e.g. the warehouse table's real name"},
+            "save_to": {"type": "string",
+                        "description": "Optional .sql file in the working directory"},
+        },
+        "required": ["question"],
+    }
+
+    def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
+        question = str(args.get("question") or "").strip()
+        dialect = str(args.get("dialect") or "snowflake").lower()
+        if dialect not in _SQL_DIALECTS:
+            return ToolOutput(False, "", error=f"dialect must be one of {_SQL_DIALECTS}.")
+        tables = _sql_tables(session, kernel, str(args.get("table") or ""))
+        if not tables:
+            return ToolOutput(False, "", error="No data is loaded, so there is no "
+                              "schema to write SQL against.")
+        if llm_client is None:
+            return ToolOutput(False, "", error="No language model is available.")
+        schema = "\n".join(
+            f"{name}(" + ", ".join(f"{c} {_sql_type(frame[c].dtype)}"
+                                   for c in list(frame.columns)[:60]) + ")"
+            for name, frame in tables.items())
+        spec = kernel.namespace.get("TASK_SPEC")
+        brief = spec.get("brief", {}) if isinstance(spec, dict) else {}
+        notes = "\n".join(f"- {n}" for n in (brief.get("data_notes") or [])[:40]) or "(none)"
+        try:
+            raw = llm_client._generate(
+                _SQL_WRITE_PROMPT.format(dialect=dialect, schema=schema, notes=notes,
+                                         question=question),
+                temperature=0.0, max_tokens=4000)
+        except Exception as exc:  # noqa: BLE001
+            return ToolOutput(False, "", error=f"SQL generation failed: {exc}")
+        sql = _strip_sql(raw)
+        if not sql:
+            return ToolOutput(False, "", error="The model returned no SQL.")
+        if _SQL_FORBIDDEN.search(sql):
+            return ToolOutput(False, f"SQL:\n{sql}", error="Refusing: the SQL modifies "
+                              "data. Only read queries are written by this tool.")
+        tested, result = _test_sql_locally(sql, tables)
+        lines = [f"{dialect.capitalize()} SQL:", sql, ""]
+        if tested:
+            lines.append(f"Test run on the local data (SQLite): {result}")
+        else:
+            lines.append(f"Not tested locally: SQLite could not run it ({result}). "
+                         f"{dialect.capitalize()}-specific syntax cannot be checked "
+                         "without the warehouse.")
+        save_to = str(args.get("save_to") or "").strip()
+        if save_to:
+            if not save_to.endswith(".sql"):
+                save_to += ".sql"
+            lines.append(SqlQueryTool._save_sql(save_to, sql, session, kernel).strip())
+        return ToolOutput(True, "\n".join(lines),
+                          artifacts={"sql": sql, "dialect": dialect, "tested": tested})
+
+
+def _strip_sql(raw: str) -> str:
+    import re as _re
+    text = _re.sub(r"<think>.*?</think>", "", raw or "", flags=_re.DOTALL).strip()
+    fence = _re.search(r"```(?:sql)?\s*(.*?)```", text, flags=_re.DOTALL | _re.IGNORECASE)
+    if fence:
+        text = fence.group(1)
+    return text.strip().rstrip(";").strip()
+
+
+def _test_sql_locally(sql: str, tables: dict[str, Any],
+                      max_rows: int = 20) -> tuple[bool, str]:
+    """Run the SQL against the frames in an in-memory SQLite database.
+    Returns (ran, summary of rows or the error)."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    try:
+        for name, frame in tables.items():
+            frame.head(500_000).to_sql(name, conn, index=False)
+        cur = conn.execute(sql)
+        cols = [d[0] for d in cur.description or []]
+        rows = cur.fetchmany(max_rows)
+        if not cols:
+            return True, "ran, no rows returned."
+        import pandas as _pd
+        shown = _pd.DataFrame(rows, columns=cols).to_string(index=False)
+        return True, f"first {len(rows)} row(s):\n{shown}"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc).splitlines()[0][:200]
+    finally:
+        conn.close()
 
 
 # ── model deployment packaging + CI/CD (generate artifacts, do not push) ──────
@@ -3215,27 +3485,27 @@ class DeployModelTool(BaseTool):
                 artifacts={"proposed": True, "output_dir": str(out)})
 
         try:
+            import base64
+            import tempfile
+
             import joblib
 
-            from agent.pipeline.deploy_packager.fastapi_builder import (
-                FastAPIBuilder,
-            )
-            out.mkdir(parents=True, exist_ok=True)
-            model_path = out / "model.joblib"
-            joblib.dump(model, model_path)
-            res = FastAPIBuilder().build(model_uri=str(model_path),
-                                         output_dir=str(out))
-            if getattr(res, "status", "error") != "ok":
-                return ToolOutput(success=False, text="",
-                                  error=f"Scaffold failed: {getattr(res, 'explanation', '')}")
-        except Exception as exc:  # noqa: BLE001
-            return ToolOutput(success=False, text="",
-                              error=f"Deployment packaging failed: {exc}")
-        return ToolOutput(
-            success=True,
-            text=f"Deployment scaffolded in {out_rel}/: {', '.join(files)}. "
-                 f"Model serialised to {out_rel}/model.joblib." + run_hint,
-            artifacts={"written": True, "output_dir": str(out), "files": files})
+            from agent.pipeline.deploy_packager.fastapi_builder import FastAPIBuilder
+            with tempfile.TemporaryDirectory(prefix="ds-deploy-") as tmp:
+                scratch = Path(tmp)
+                joblib.dump(model, scratch / "model.joblib")
+                FastAPIBuilder().build(model_uri="model.joblib", output_dir=tmp)
+                for item in scratch.iterdir():
+                    destination = out / item.name
+                    rec = _stage_change(kernel, kind="file", rel=str(destination.relative_to(root)),
+                        path=destination, summary=f"Publish deployment file {item.name}",
+                        make_dirs=[str(out)] if not out.exists() else [])
+                    rec["binary"] = base64.b64encode(item.read_bytes()).decode()
+            return ToolOutput(True, "Deployment files staged as immutable snapshots. "
+                              "Approve publication in Pending changes." + run_hint,
+                              artifacts={"staged": True, "files": files})
+        except Exception as exc:
+            return ToolOutput(False, "", error=f"Deployment packaging failed: {exc}")
 
 
 _GITHUB_CI = """\
@@ -3357,6 +3627,13 @@ class ScaffoldCICDTool(BaseTool):
                 text=f"PROPOSED {provider} CI/CD at {rel} (writes are OFF — "
                      f"nothing written). Enable writes to create it.\n\n{content}",
                 artifacts={"proposed": True, "path": str(target)})
+        held = _hold_for_approval(
+            kernel, kind="file", rel=rel, path=target,
+            verb=f"create {provider} CI/CD at {rel}", content=content,
+            diff=_unified_diff("", content, rel),
+            make_dirs=[] if target.parent.is_dir() else [str(target.parent)])
+        if held is not None:
+            return held
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
@@ -3384,7 +3661,8 @@ class DeepEdaTool(BaseTool):
         "univariate panorama (box plots + normality), bivariate type-dispatched "
         "analysis (num×num / cat×num / cat×cat with correct stats), clustered "
         "correlation & Cramér's V heatmaps, PCA + parallel coordinates, missingness "
-        "matrix, and an LLM synthesis paragraph. Requires TARGET to be set."
+        "matrix, and an LLM synthesis paragraph. Works without a target: the "
+        "target-vs-feature stage and the narrative then are skipped."
     )
     input_schema = {
         "type": "object",
@@ -3434,17 +3712,17 @@ class DeepEdaTool(BaseTool):
                     _cnt = (df[_c] == _sv).sum()
                     if _cnt >= 3 and _cnt / _n < 0.15:
                         _find('warning', 'placeholder_value',
-                              f"Column '{_c}': {_cnt} rows = {_sv} "
-                              f"({_cnt/_n:.1%}) — likely encoded null",
-                              f"Replace {_sv} in '{_c}' with NaN before modelling")
+                              f"Column '{{_c}}': {{_cnt}} rows = {{_sv}} "
+                              f"({{_cnt/_n:.1%}}) — likely encoded null",
+                              f"Replace {{_sv}} in '{{_c}}' with NaN before modelling")
 
             # ── Check 2: Zero-inflation ──────────────────────────────────────
             for _c in _num.columns:
                 _zero_rate = (df[_c] == 0).mean()
                 if _zero_rate > 0.5 and df[_c].std() > 0:
                     _find('info', 'zero_inflation',
-                          f"'{_c}': {_zero_rate:.1%} zeros",
-                          f"Consider log1p({_c}) or binary indicator for zero-ness")
+                          f"'{{_c}}': {{_zero_rate:.1%}} zeros",
+                          f"Consider log1p({{_c}}) or binary indicator for zero-ness")
 
             # ── Check 3: Extreme skew → log transform recommendation ─────────
             for _c in _num.columns:
@@ -3452,16 +3730,16 @@ class DeepEdaTool(BaseTool):
                     _sk = abs(float(df[_c].skew()))
                     if _sk > 3:
                         _find('info', 'extreme_skew',
-                              f"'{_c}': |skew|={_sk:.2f}",
-                              f"Apply log1p('{_c}') for linear/distance-based models")
+                              f"'{{_c}}': |skew|={{_sk:.2f}}",
+                              f"Apply log1p('{{_c}}') for linear/distance-based models")
 
             # ── Check 4: Near-constant columns ───────────────────────────────
             for _c in df.columns:
                 _top_freq = df[_c].value_counts(normalize=True).iloc[0]
                 if _top_freq > 0.99:
                     _find('warning', 'near_constant',
-                          f"'{_c}': dominant value covers {_top_freq:.1%} of rows",
-                          f"Drop '{_c}' — provides near-zero information")
+                          f"'{{_c}}': dominant value covers {{_top_freq:.1%}} of rows",
+                          f"Drop '{{_c}}' — provides near-zero information")
 
             # ── Check 5: Bimodality coefficient per numeric column ───────────
             for _c in _num.columns[:30]:
@@ -3475,9 +3753,9 @@ class DeepEdaTool(BaseTool):
                 _bc = (_sk**2 + 1) / _denom if _denom != 0 else 0
                 if _bc > 0.555:
                     _find('info', 'bimodal',
-                          f"'{_c}': bimodality coefficient BC={_bc:.3f}>0.555 — "
+                          f"'{{_c}}': bimodality coefficient BC={{_bc:.3f}}>0.555 — "
                           f"possible hidden subpopulation",
-                          f"Investigate '{_c}' for hidden grouping; "
+                          f"Investigate '{{_c}}' for hidden grouping; "
                           f"consider creating a binary split feature")
 
             # ── Check 6: Structural break (sudden mean shift) ────────────────
@@ -3489,8 +3767,8 @@ class DeepEdaTool(BaseTool):
                 _std_pool = np.std(_col) + 1e-9
                 if abs(_m1 - _m2) / _std_pool > 1.5:
                     _find('warning', 'structural_break',
-                          f"'{_c}': mean shifts from {_m1:.3g} (first half) "
-                          f"to {_m2:.3g} (second half) — z={abs(_m1-_m2)/_std_pool:.2f}",
+                          f"'{{_c}}': mean shifts from {{_m1:.3g}} (first half) "
+                          f"to {{_m2:.3g}} (second half) — z={{abs(_m1-_m2)/_std_pool:.2f}}",
                           f"Check data ordering; consider row-index as a feature "
                           f"or split dataset at the break point")
 
@@ -3502,9 +3780,9 @@ class DeepEdaTool(BaseTool):
                     if _j <= _i: continue
                     if _corr_m.loc[_ci, _cj] > 0.99:
                         _find('warning', 'redundant_pair',
-                              f"'{_ci}' ↔ '{_cj}': |r|={_corr_m.loc[_ci, _cj]:.4f} "
+                              f"'{{_ci}}' ↔ '{{_cj}}': |r|={{_corr_m.loc[_ci, _cj]:.4f}} "
                               f"— near-duplicate columns",
-                              f"Drop one of '{_ci}' / '{_cj}' to reduce multicollinearity")
+                              f"Drop one of '{{_ci}}' / '{{_cj}}' to reduce multicollinearity")
 
             # ── Check 8: Class imbalance severity ────────────────────────────
             if _tgt and _tgt in df.columns and ('classif' in _task_type or 'binary' in _task_type):
@@ -3512,13 +3790,13 @@ class DeepEdaTool(BaseTool):
                 _imb = _vc_tgt.min() / _vc_tgt.max()
                 if _imb < 0.1:
                     _find('critical', 'severe_class_imbalance',
-                          f"Target '{_tgt}': imbalance ratio={_imb:.3f} "
-                          f"({_vc_tgt.min()} minority vs {_vc_tgt.max()} majority)",
+                          f"Target '{{_tgt}}': imbalance ratio={{_imb:.3f}} "
+                          f"({{_vc_tgt.min()}} minority vs {{_vc_tgt.max()}} majority)",
                           "Use PR-AUC metric; apply SMOTE or class_weight='balanced'; "
                           "consider cost-sensitive learning")
                 elif _imb < 0.3:
                     _find('warning', 'class_imbalance',
-                          f"Target '{_tgt}': imbalance ratio={_imb:.3f}",
+                          f"Target '{{_tgt}}': imbalance ratio={{_imb:.3f}}",
                           "Prefer PR-AUC over accuracy; use class_weight='balanced'")
 
             # ── Check 9: Target leakage (single-feature AUC > 0.85) ─────────
@@ -3538,9 +3816,9 @@ class DeepEdaTool(BaseTool):
                             _a = max(_a, 1 - _a)
                             if _a > 0.85:
                                 _find('critical', 'leakage_candidate',
-                                      f"'{_c}': single-feature AUC={_a:.4f} > 0.85 — "
+                                      f"'{{_c}}': single-feature AUC={{_a:.4f}} > 0.85 — "
                                       f"suspiciously predictive",
-                                      f"Verify '{_c}' is causally available at prediction "
+                                      f"Verify '{{_c}}' is causally available at prediction "
                                       f"time and not derived from the target or post-event data")
                         except Exception:
                             pass
@@ -3549,8 +3827,8 @@ class DeepEdaTool(BaseTool):
             _high_miss = (df.isna().mean() > 0.30)
             for _c in _high_miss[_high_miss].index:
                 _find('warning', 'high_missingness',
-                      f"'{_c}': {df[_c].isna().mean():.1%} missing",
-                      f"Consider dropping '{_c}' or using iterative imputation; "
+                      f"'{{_c}}': {{df[_c].isna().mean():.1%}} missing",
+                      f"Consider dropping '{{_c}}' or using iterative imputation; "
                       f"create missingness indicator feature")
 
             # ── Check 11: Highly skewed target (regression) ──────────────────
@@ -3560,7 +3838,7 @@ class DeepEdaTool(BaseTool):
                     _tgt_sk = abs(float(_tgt_col.skew()))
                     if _tgt_sk > 2:
                         _find('warning', 'skewed_target',
-                              f"Target '{_tgt}': |skew|={_tgt_sk:.2f}",
+                              f"Target '{{_tgt}}': |skew|={{_tgt_sk:.2f}}",
                               "Apply log1p transform to target; use RMSE on log scale "
                               "(RMSLE); or switch to quantile regression")
 
@@ -3569,8 +3847,8 @@ class DeepEdaTool(BaseTool):
                 _top = df[_c].value_counts(normalize=True).iloc[0]
                 if _top > 0.95:
                     _find('warning', 'dominant_category',
-                          f"'{_c}': top category = {_top:.1%} of rows",
-                          f"Drop '{_c}' — near-zero variance categorical")
+                          f"'{{_c}}': top category = {{_top:.1%}} of rows",
+                          f"Drop '{{_c}}' — near-zero variance categorical")
 
             # Sort: critical first, then warning, then info
             _sev_order = {{'critical': 0, 'warning': 1, 'info': 2}}
@@ -3582,9 +3860,9 @@ class DeepEdaTool(BaseTool):
             for _f in _findings:
                 _icon = {{'critical': '🚨', 'warning': '⚠', 'info': 'ℹ'}}.get(
                     _f['severity'], '?')
-                print(f"  [{_f['severity'].upper()}] {_icon} {_f['check']}")
-                print(f"    Detail : {_f['detail']}")
-                print(f"    Action : {_f['action']}")
+                print(f"  [{{_f['severity'].upper()}}] {{_icon}} {{_f['check']}}")
+                print(f"    Detail : {{_f['detail']}}")
+                print(f"    Action : {{_f['action']}}")
                 print()
             if not _findings:
                 print("  No significant findings detected.")
@@ -3786,8 +4064,8 @@ class DeepEdaTool(BaseTool):
             print("\\nRecommended Transforms:")
             for _op, _cols in _rec_transforms.items():
                 if _cols:
-                    print(f"  {_op}: {_cols[:5]}"
-                          + (f" (+{len(_cols)-5} more)" if len(_cols) > 5 else ""))
+                    print(f"  {{_op}}: {{_cols[:5]}}"
+                          + (f" (+{{len(_cols)-5}} more)" if len(_cols) > 5 else ""))
 
             # ── Combined box plot for all numerics ──────────────────────────
             if len(_num.columns) > 0:
@@ -3880,9 +4158,9 @@ class DeepEdaTool(BaseTool):
                         }}
                         _decision = _decision_map[(_adf_rej, _kpss_rej)]
                         print(f"  ADF:  stat={{_adf_stat:.4f}}, p={{_adf_p:.4f}} "
-                              f"({'reject' if _adf_rej else 'non-reject'} H0)")
+                              f"({{'reject' if _adf_rej else 'non-reject'}} H0)")
                         print(f"  KPSS: stat={{_kpss_stat:.4f}}, p≈{{_kpss_p:.4f}} "
-                              f"({'reject' if _kpss_rej else 'non-reject'} H0)")
+                              f"({{'reject' if _kpss_rej else 'non-reject'}} H0)")
                         print(f"  Decision: {{_decision}}")
                         EDA_CTX['stationarity'] = {{'adf_p': _adf_p, 'kpss_p': _kpss_p,
                                                     'decision': _decision}}
@@ -3902,9 +4180,9 @@ class DeepEdaTool(BaseTool):
                         _seas_var  = np.var(_stl.seasonal)
                         _resid_var = np.var(_stl.resid)
                         _total_var = _trend_var + _seas_var + _resid_var + 1e-12
-                        print(f"  STL: trend={_trend_var/_total_var:.1%}, "
-                              f"seasonal={_seas_var/_total_var:.1%}, "
-                              f"residual={_resid_var/_total_var:.1%}")
+                        print(f"  STL: trend={{_trend_var/_total_var:.1%}}, "
+                              f"seasonal={{_seas_var/_total_var:.1%}}, "
+                              f"residual={{_resid_var/_total_var:.1%}}")
                         EDA_CTX['stl'] = {{'trend_pct': _trend_var/_total_var,
                                            'seasonal_pct': _seas_var/_total_var,
                                            'residual_pct': _resid_var/_total_var}}
@@ -3954,13 +4232,13 @@ class DeepEdaTool(BaseTool):
                             pass
                     if _bics:
                         _best_k = min(_bics, key=lambda x: x[1])[0]
-                        print(f"  GMM-BIC: optimal k={_best_k} components")
+                        print(f"  GMM-BIC: optimal k={{_best_k}} components")
                         EDA_CTX['gmm_k'] = _best_k
                         _ks = [b[0] for b in _bics]; _bv = [b[1] for b in _bics]
                         fig_bic, ax_bic = plt.subplots(figsize=(7, 3.5))
                         ax_bic.plot(_ks, _bv, 'o-', color='steelblue')
                         ax_bic.axvline(_best_k, color='#d62728', linestyle='--',
-                                       label=f'Best k={_best_k}')
+                                       label=f'Best k={{_best_k}}')
                         ax_bic.set_xlabel('# GMM components')
                         ax_bic.set_ylabel('BIC')
                         ax_bic.set_title('GMM-BIC model selection')
@@ -3978,13 +4256,13 @@ class DeepEdaTool(BaseTool):
                         _thresh_ae = np.percentile(_recon_err, 95)
                         _n_anom = (_recon_err > _thresh_ae).sum()
                         print(f"  Autoencoder reconstruction error: "
-                              f"{_n_anom} samples above 95th-percentile threshold "
-                              f"(thresh={_thresh_ae:.4f})")
+                              f"{{_n_anom}} samples above 95th-percentile threshold "
+                              f"(thresh={{_thresh_ae:.4f}})")
                         EDA_CTX['autoencoder_n_anomalies'] = int(_n_anom)
                         fig_ae, ax_ae = plt.subplots(figsize=(9, 3.5))
                         ax_ae.hist(_recon_err, bins=50, color='steelblue', edgecolor='white')
                         ax_ae.axvline(_thresh_ae, color='#d62728', linestyle='--',
-                                      label=f'95th pct ({_thresh_ae:.4f})')
+                                      label=f'95th pct ({{_thresh_ae:.4f}})')
                         ax_ae.set_xlabel('Reconstruction error (MSE per sample)')
                         ax_ae.set_title('Autoencoder Anomaly Score Distribution')
                         ax_ae.legend(fontsize=8)
@@ -4241,8 +4519,8 @@ class DeepEdaTool(BaseTool):
                 _var_exp = _pca.explained_variance_ratio_
 
                 print("=== PCA ===")
-                print(f"  PC1 explains {_var_exp[0]:.1%}, "
-                      f"PC1+PC2 explains {_var_exp[:2].sum():.1%} of variance")
+                print(f"  PC1 explains {{_var_exp[0]:.1%}}, "
+                      f"PC1+PC2 explains {{_var_exp[:2].sum():.1%}} of variance")
                 EDA_CTX['pca_var_exp'] = _var_exp[:5].tolist()
 
                 # ── Scree plot ───────────────────────────────────────────────
@@ -4280,8 +4558,8 @@ class DeepEdaTool(BaseTool):
                         _sc = ax_pca.scatter(_comps[:, 0], _comps[:, 1],
                                              c=_y_pca, cmap='viridis', alpha=0.5, s=20)
                         plt.colorbar(_sc, ax=ax_pca, label=_tgt)
-                    ax_pca.set_xlabel(f'PC1 ({_var_exp[0]:.1%})')
-                    ax_pca.set_ylabel(f'PC2 ({_var_exp[1]:.1%})')
+                    ax_pca.set_xlabel(f'PC1 ({{_var_exp[0]:.1%}})')
+                    ax_pca.set_ylabel(f'PC2 ({{_var_exp[1]:.1%}})')
                     ax_pca.set_title(f'PCA — PC1 vs PC2  (target: {{_tgt}})')
                     plt.tight_layout(); plt.show()
 
@@ -4293,7 +4571,7 @@ class DeepEdaTool(BaseTool):
                 ax_load.barh(_load1.index[::-1], _load1.values[::-1], color=_lc[::-1])
                 ax_load.axvline(0, color='black', linewidth=0.8)
                 ax_load.set_xlabel('Loading on PC1')
-                ax_load.set_title(f'PC1 Feature Loadings  ({_var_exp[0]:.1%} variance)')
+                ax_load.set_title(f'PC1 Feature Loadings  ({{_var_exp[0]:.1%}} variance)')
                 plt.tight_layout(); plt.show()
 
                 # ── t-SNE (deep only, small datasets) ───────────────────────
@@ -4763,7 +5041,600 @@ class MLStrategyAgentTool(BaseTool):
 
 # ── registry ──────────────────────────────────────────────────────────────────
 
+# Output budget per planning stage. A reasoning model spends most of this
+# thinking: measured with gpt-oss:20b on the WorkForce brief, the scope stage
+# produced 10,147 characters of thinking before emitting the plan, and at 1500
+# and 3000 tokens it never reached the JSON at all. At 8000 it completed in
+# 284 s. Override with DSAGENT_PLAN_TOKENS.
+_PLAN_STAGE_TOKENS = int(os.environ.get("DSAGENT_PLAN_TOKENS", "8000"))
+
+_PLAN_SECTIONS = ("objective", "requirement_coverage", "data_preparation",
+                  "eda_questions_task", "eda_questions_independent", "risks",
+                  "feature_engineering", "modelling", "evaluation",
+                  "deliverables")
+
+_PLAN_COMMON = """\
+THE BRIEF IN ITS OWN TERMS:
+{brief_context}
+
+WHAT THE BRIEF ASKS FOR:
+{requirements}
+
+TASK SPEC EXTRACTED FROM THE BRIEF:
+{task_spec}
+
+THE ACTUAL DATA (dtypes, missingness, cardinality, value ranges):
+{data_summary}
+
+{evidence}"""
+
+# Stage one: what is being asked, against what the data actually holds.
+_PLAN_SCOPE_PROMPT = """\
+/no_think
+You are the lead data scientist. This is the FIRST half of planning: work out
+what is really being asked and whether this data can answer it.
+
+{mode_instruction}
+
+Reading the brief is step one, not the plan. Do not restate the brief. Compare
+what it asks for against the columns below and say what follows.
+
+""" + _PLAN_COMMON + """
+
+Think it through in this order:
+1. For each thing the brief asks for, which columns actually serve it?
+2. What does the brief ask for that the data does NOT contain, so has to be
+   derived, joined or approximated? Name the derivation.
+3. What could invalidate the whole approach (leakage, a target that is mostly
+   missing, too few positives, a join that does not hold, a column that is
+   constant or malformed)? Those become questions EDA must settle first.
+
+Reply with a single JSON object and nothing else:
+{{"objective": "one or two sentences naming the decision this work supports",
+  "requirement_coverage": [
+     {{"requirement": "the ask, in a few words",
+       "approach": "what you will do about it",
+       "columns": ["column names that serve it"],
+       "open_question": "what must be checked before this is safe, or empty"}}],
+  "eda_questions_task": ["a question that must be answered to deliver the \
+brief, phrased so an analysis can settle it", ...],
+  "eda_questions_independent": ["a question about the data in its own right \
+that the brief does not ask but a careful analyst would check anyway", ...],
+  "risks": ["what could make this analysis wrong, and how it will be checked"]}}
+
+Rules:
+- Every entry names a real column, a real number, or a real derivation. An
+  entry that would read the same for any dataset is wrong: delete it.
+- requirement_coverage must cover every requirement listed above. If the data
+  cannot support one, say so in open_question rather than inventing a step.
+- eda_questions_independent must NOT be restatements of the brief. They are the
+  checks you would run on this data whatever the task was: distributions,
+  missingness structure, duplicates, time coverage, relationships between
+  columns, anything that looks wrong or malformed above.
+- eda_questions_task holds 4 to 8 ANALYTICAL questions whose answers deliver
+  the brief (patterns, comparisons between entities, concentration, trends),
+  most important first. Data-quality checks belong in
+  eda_questions_independent, at most 5 of them. Never list the same question
+  twice in different words.
+"""
+
+# Stage two: how the work gets done, grounded in stage one.
+_PLAN_APPROACH_PROMPT = """\
+/no_think
+You are the lead data scientist. This is the SECOND half of planning. The scope
+below is already settled; decide how the work gets done.
+
+{mode_instruction}
+
+""" + _PLAN_COMMON + """
+
+SCOPE ALREADY AGREED (plan to serve this):
+{scope}
+
+Reply with a single JSON object and nothing else:
+{{"data_preparation": ["concrete step naming real columns", ...],
+  "feature_engineering": ["concrete step, naming columns", ...],
+  "modelling": ["candidate model and why it suits THIS data", ...],
+  "evaluation": ["metric and validation scheme, with the reason", ...],
+  "deliverables": ["what is handed over, matching what the brief asked for"],
+  "revision_notes": ["what changed from the previous plan and which finding \
+caused it", ...]}}
+
+Rules:
+- Every choice is justified by a number, a dtype or a finding you can point to
+  above. No generic checklists.
+- Address the open_question entries and risks from the scope: either a step
+  resolves one, or say which EDA answer it waits on.
+- modelling lists only what the brief's questions need. With no labelled
+  target, name unsupervised or rule-based methods, never a supervised model.
+  When the brief asks for no model at all, return [].
+- deliverables match what the brief asks for and who it is for (audiences).
+- revision_notes is empty on a first plan.
+"""
+
+
+class WorkPlanTool(BaseTool):
+    name = "work_plan"
+    description = (
+        "Write or revise the plan for the whole piece of work, and keep it on "
+        "the session as WORK_PLAN. Call it early to plan from the brief and the "
+        "data schema, then call it AGAIN with revise=true after EDA "
+        "(eda_profile / deep_eda / data_analysis_agent) so the feature "
+        "engineering and model choices are rewritten from what the data "
+        "actually showed rather than from assumptions. Pass save_to to also "
+        "write the plan as a markdown file in the working directory."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "revise": {"type": "boolean",
+                       "description": "True to revise the existing plan using "
+                                      "EDA findings (the post-EDA checkpoint)"},
+            "save_to": {"type": "string",
+                        "description": "Optional markdown filename, e.g. "
+                                       "analysis_plan.md"},
+            "notes": {"type": "string",
+                      "description": "Anything the user asked for that the "
+                                     "brief does not cover"},
+        },
+    }
+
+    def execute(self, args, *, session, kernel, llm_client) -> ToolOutput:
+        ns = kernel.namespace
+        spec: dict = ns.get("TASK_SPEC") or {}
+        revise = bool(args.get("revise"))
+        existing = ns.get("WORK_PLAN") if isinstance(ns.get("WORK_PLAN"), dict) else None
+
+        report: dict = ns.get("DATA_ANALYSIS_REPORT") or {}
+        log = ns.get("EXPLORATION_LOG")
+        log = log if isinstance(log, list) else []
+        turn = getattr(kernel, "turn_deadline", None)
+        if (existing and not revise and not args.get("notes")
+                and turn is not None and existing.get("turn") == turn):
+            # Already planned this turn: rewriting from the same inputs costs
+            # minutes of model time and changes nothing.
+            return ToolOutput(
+                success=True,
+                text=(f"The work plan (version {existing.get('version', 1)}) was "
+                      "already written this turn; it is unchanged. Work through "
+                      "the EDA agenda, then call work_plan with revise=true.\n\n"
+                      + _plan_to_markdown(existing, spec))[:6000],
+                artifacts={"work_plan": True, "version": existing.get("version", 1),
+                           "reused": True})
+        if revise and not eda_has_run(kernel):
+            return ToolOutput(
+                success=False, text="",
+                error="Nothing to revise against yet. Explore the data first "
+                      "(execute_code, eda_profile, deep_eda or "
+                      "data_analysis_agent), then call work_plan with "
+                      "revise=true.")
+
+        reqs = [r for r in (spec.get("specific_requirements") or [])
+                if isinstance(r, str) and r.strip()]
+        req_text = "\n".join(f"- {r[:300]}" for r in reqs[:15]) or "(not stated)"
+        if args.get("notes"):
+            req_text += f"\n- (from the user) {str(args['notes'])[:300]}"
+
+        # Bounded: this goes in a prompt alongside the brief and the
+        # EDA evidence, and num_ctx is small on a local model.
+        data_profile = _profile_for_planning(ns)[:6000]
+
+        evidence = ""
+        if revise:
+            evidence = "WHAT EDA ACTUALLY FOUND (plan against these, not assumptions):\n"
+            evidence += _summarise_report(report)
+            if log:
+                evidence += "\nRunning findings:\n" + "\n".join(
+                    f"- {x}" for x in log[-10:])
+            asked = [str(a.get("question", "")) for a in (ns.get("EDA_AGENDA") or [])
+                     if isinstance(a, dict)]
+            if asked:
+                evidence += ("\n\nEDA QUESTIONS ALREADY ON THE AGENDA (do not repeat "
+                             "them; add only new questions the findings raise):\n"
+                             + "\n".join(f"- {q[:160]}" for q in asked[:24]))
+            if existing:
+                evidence += ("\n\nTHE PLAN YOU ARE REVISING:\n"
+                             + json.dumps({k: existing.get(k)
+                                           for k in ("feature_engineering",
+                                                     "modelling", "evaluation")},
+                                          indent=1)[:1500])
+            mode = ("Revise the plan below using the EDA findings. Change the "
+                    "feature_engineering, modelling and evaluation sections "
+                    "wherever a finding contradicts the original assumption, "
+                    "and record each change in revision_notes.")
+        else:
+            mode = ("Write the first plan. It will be revised after EDA, so "
+                    "state the assumptions the later evidence should test.")
+
+        common = dict(
+            brief_context=_brief_context(spec),
+            requirements=req_text,
+            task_spec=json.dumps({k: spec.get(k) for k in (
+                "task_type", "target_column", "evaluation_metric",
+                "aggregation_needed", "task_description")}, indent=1)[:800],
+            data_summary=data_profile,
+            evidence=evidence)
+
+        def _ask(prompt: str):
+            return _extract_json_obj(llm_client._generate(
+                prompt, temperature=0.1, max_tokens=_PLAN_STAGE_TOKENS,
+                json_mode=True))
+
+        # Two stages on purpose. One call carrying every section runs past the
+        # request timeout on a large local model, and a reply cut off mid-JSON
+        # loses the lot. Split, the scope survives even if the approach fails,
+        # and the approach is written against a settled scope rather than
+        # against the brief alone.
+        try:
+            scope = _ask(_PLAN_SCOPE_PROMPT.format(
+                mode_instruction=mode, **common))
+        except Exception as exc:  # noqa: BLE001
+            return ToolOutput(success=False, text="",
+                              error=f"Plan (scope) failed: {exc}")
+        if not isinstance(scope, dict) or not scope.get("objective"):
+            return ToolOutput(success=False, text="",
+                              error="The model did not return a usable scope. "
+                                    "Try again, or narrow the request.")
+
+        plan: dict = dict(scope)
+        partial = ""
+        try:
+            approach = _ask(_PLAN_APPROACH_PROMPT.format(
+                mode_instruction=mode,
+                scope=json.dumps({k: scope.get(k) for k in (
+                    "objective", "requirement_coverage", "risks")},
+                    indent=1)[:2000],
+                **common))
+        except Exception as exc:  # noqa: BLE001
+            approach, partial = None, f" (the approach half failed: {exc})"
+        if isinstance(approach, dict):
+            plan.update({k: v for k, v in approach.items() if v})
+        elif not partial:
+            partial = (" (the approach half did not come back usable; the "
+                       "scope below stands and can be extended by calling "
+                       "work_plan again)")
+
+        plan["revised_after_eda"] = revise or bool(
+            existing and existing.get("revised_after_eda"))
+        plan["version"] = int((existing or {}).get("version", 0)) + 1
+        plan["turn"] = turn
+        ns["WORK_PLAN"] = plan
+        agenda = sync_agenda(ns, plan)
+        n_open = sum(a.get("status") == "open" for a in agenda)
+
+        md = _plan_to_markdown(plan, spec)
+        text = (f"{'Revised' if revise else 'Wrote'} the work plan "
+                f"(version {plan['version']}"
+                + (", grounded in EDA findings" if revise else
+                   ", assumptions to be tested by EDA") + ")."
+                + partial
+                + f" EDA agenda: {len(agenda)} questions, {n_open} open."
+                + "\n\n" + md)
+
+        save_to = (args.get("save_to") or "").strip()
+        if save_to:
+            saved = _save_plan_file(save_to, md, session=session, kernel=kernel)
+            text += f"\n\n{saved}"
+        return ToolOutput(success=True, text=text[:6000],
+                          artifacts={"work_plan": True,
+                                     "version": plan["version"],
+                                     "revised_after_eda": plan["revised_after_eda"]})
+
+
+def _brief_context(spec: dict) -> str:
+    """The brief's objective, audiences, constraints and data notes, for the
+    planner. Empty sections are left out; bounded for a small context."""
+    brief = spec.get("brief") if isinstance(spec.get("brief"), dict) else {}
+    if not brief:
+        return "(not available)"
+    parts = []
+    if brief.get("objective"):
+        parts.append(f"Objective: {brief['objective']}")
+    if brief.get("task_nature"):
+        parts.append(f"Nature of the task: {brief['task_nature']}")
+    for label, key, n in (("Audiences", "audiences", 6), ("Constraints", "constraints", 8),
+                          ("Data dictionary", "data_notes", 30),
+                          ("Left unclear by the brief", "open_questions", 6)):
+        items = [str(x)[:200] for x in (brief.get(key) or [])[:n]]
+        if items:
+            parts.append(f"{label}:\n" + "\n".join(f"- {x}" for x in items))
+    return "\n".join(parts)[:3500]
+
+
+def _extract_json_obj(raw: str):
+    """First JSON object in the model's reply, or None.
+
+    Falls back to repairing a reply that was cut off by the token budget: a
+    local model that runs out mid-list leaves valid JSON followed by an
+    unterminated tail, and discarding the whole plan over the last item wastes
+    the minutes it took to produce. Closes any open string and brackets and
+    reparses.
+    """
+    import re as _re
+    txt = (raw or "").strip()
+    try:
+        return json.loads(txt)
+    except Exception:  # noqa: BLE001
+        pass
+    m = _re.search(r"\{.*\}", txt, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:  # noqa: BLE001
+            pass
+    start = txt.find("{")
+    if start == -1:
+        return None
+    return _repair_truncated_json(txt[start:])
+
+
+def _repair_truncated_json(txt: str):
+    """Close whatever the model left open, then parse. None if still broken.
+
+    Walks once recording, for every position, whether it sits inside a string
+    and what brackets are open there. Then tries cut points from the end
+    backwards, stopping at each place a complete value ends, trimming any
+    trailing comma and closing the brackets that were open AT THAT POINT. The
+    stack has to match the cut, which is what a single pass over the whole
+    string gets wrong when the tail is discarded.
+    """
+    stacks: list[tuple[bool, tuple]] = []      # per index: (in_string, stack)
+    stack: list[str] = []
+    in_str = False
+    escaped = False
+    for ch in txt:
+        stacks.append((in_str, tuple(stack)))
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+
+    for i in range(len(txt) - 1, -1, -1):
+        # A complete value ends at }, ] or the closing quote of a string.
+        if txt[i] not in "}]\"":
+            continue
+        if txt[i] == '"' and stacks[i][0] is False:
+            continue                     # an opening quote, not a closing one
+        body = txt[:i + 1].rstrip()
+        while body.endswith(","):
+            body = body[:-1].rstrip()
+        # Brackets open immediately AFTER this character.
+        depth = list(stacks[i][1])
+        if txt[i] in "}]" and depth:
+            depth.pop()
+        body += "".join(reversed(depth))
+        try:
+            parsed = json.loads(body)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _profile_for_planning(ns: dict, max_cols: int = 40) -> str:
+    """Real evidence about the loaded data, for the planner to reason over.
+
+    A plan written from a column list can only restate the brief. To decide
+    what to derive, what to join on and what the data cannot answer, the
+    planner needs dtypes, how much is missing, how many distinct values a
+    column holds, and what the values look like. This is cheap: it reads the
+    frames already in memory and never runs a model.
+    """
+    out: list[str] = []
+    frames = [(n, ns.get(n)) for n in ["df"] + [f"df{i}" for i in range(2, 8)]]
+    frames = [(n, f) for n, f in frames if f is not None]
+    if not frames:
+        return "(no data loaded)"
+    for name, df in frames:
+        if df is None:
+            continue
+        try:
+            out.append(f"\n{name}: {df.shape[0]:,} rows x {df.shape[1]} columns")
+            n_dup = int(df.duplicated().sum())
+            if n_dup:
+                out.append(f"  duplicate rows: {n_dup:,}")
+            cols = list(df.columns)[:max_cols]
+            for c in cols:
+                s = df[c]
+                null_pct = float(s.isna().mean() * 100)
+                nun = int(s.nunique(dropna=True))
+                bits = [f"  - {c} ({s.dtype})", f"nulls {null_pct:.0f}%",
+                        f"{nun:,} distinct"]
+                if nun and nun <= 8:
+                    vals = [str(v)[:24] for v in s.dropna().unique()[:8]]
+                    bits.append("values " + ", ".join(vals))
+                elif s.dtype.kind in "if":
+                    try:
+                        bits.append(f"range {s.min():.4g}..{s.max():.4g}, "
+                                    f"median {s.median():.4g}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif s.dtype.kind in "OU":
+                    vals = [str(v)[:24] for v in s.dropna().unique()[:3]]
+                    if vals:
+                        bits.append("e.g. " + ", ".join(vals))
+                out.append(" | ".join(bits))
+            if len(df.columns) > max_cols:
+                out.append(f"  … +{len(df.columns) - max_cols} more columns")
+        except Exception:  # noqa: BLE001
+            out.append(f"{name}: (could not profile)")
+    # Shared columns matter: they are the join keys a plan has to name.
+    if len(frames) > 1:
+        try:
+            first = frames[0][1]
+            if first is None:
+                return "\n".join(out)
+            shared = set(first.columns)
+            for _, f in frames[1:]:
+                if f is not None:
+                    shared &= set(f.columns)
+            if shared:
+                out.append(f"\nColumns present in every file (possible join "
+                           f"keys): {sorted(shared)[:20]}")
+        except Exception:  # noqa: BLE001
+            pass
+    return "\n".join(out)
+
+
+def _summarise_report(report: dict) -> str:
+    """The EDA facts a plan should react to, as short lines."""
+    if not report:
+        return "(no structured analysis report; rely on the running findings)"
+    out: list[str] = []
+    for key, label in (
+        ("n_rows", "rows"), ("n_cols", "columns"), ("target", "target"),
+        ("task_type", "task type"), ("recommended_metric", "suggested metric"),
+        ("class_imbalance_ratio", "class imbalance (minority/majority)"),
+    ):
+        if report.get(key) not in (None, "", {}, []):
+            out.append(f"- {label}: {report[key]}")
+    for key, label in (
+        ("leakage_suspects", "LEAKING columns (must be dropped)"),
+        ("near_constant_cols", "near-constant columns"),
+        ("high_cardinality_cols", "high-cardinality categoricals"),
+        ("outlier_cols", "columns with heavy outliers"),
+    ):
+        vals = report.get(key) or []
+        if vals:
+            out.append(f"- {label}: {list(vals)[:10]}")
+    skew = report.get("skewed_cols") or {}
+    if skew:
+        out.append(f"- skewed columns: {list(skew)[:10]}")
+    nulls = report.get("null_pcts") or {}
+    if nulls:
+        out.append(f"- columns with notable nulls: "
+                   f"{list(nulls.items())[:8]}")
+    mi = report.get("top_mi_features") or []
+    if mi:
+        out.append(f"- most informative features: {mi[:10]}")
+    if report.get("analyst_narrative"):
+        out.append(f"- analyst notes: {str(report['analyst_narrative'])[:400]}")
+    return "\n".join(out) or "(report present but empty)"
+
+
+def _plan_to_markdown(plan: dict, spec: dict) -> str:
+    """Render the plan for a human, and for the .md file."""
+    titles = {
+        "objective": "Objective",
+        "requirement_coverage": "How each requirement is covered",
+        "data_preparation": "Data preparation",
+        "eda_questions_task": "EDA: questions the brief requires answering",
+        "eda_questions_independent": "EDA: independent checks on the data",
+        "risks": "What could make this wrong",
+        "feature_engineering": "Feature engineering",
+        "modelling": "Modelling",
+        "evaluation": "Evaluation",
+        "deliverables": "Deliverables",
+    }
+    lines = ["# Analysis plan", ""]
+    if plan.get("revised_after_eda"):
+        lines += ["_Revised after EDA: the feature and model choices below "
+                  "follow what the data showed._", ""]
+    else:
+        lines += ["_First pass, written before EDA. The feature and model "
+                  "choices are assumptions to be tested._", ""]
+    if spec.get("target_column"):
+        lines += [f"Target: `{spec['target_column']}`  ",
+                  f"Metric: `{spec.get('evaluation_metric') or 'to be decided'}`", ""]
+    for key in _PLAN_SECTIONS:
+        val = plan.get(key)
+        if not val:
+            continue
+        lines.append(f"## {titles.get(key, key)}")
+        if isinstance(val, str):
+            lines.append(val)
+        elif key == "requirement_coverage":
+            # A table, because the point of this section is the mapping: which
+            # ask, handled how, using which columns, and what is still unknown.
+            lines += ["| Requirement | Approach | Columns | Open question |",
+                      "| --- | --- | --- | --- |"]
+            for item in val:
+                if not isinstance(item, dict):
+                    lines.append(f"| {item} |  |  |  |")
+                    continue
+                cols = item.get("columns") or []
+                cols = ", ".join(f"`{c}`" for c in cols) if isinstance(cols, list) \
+                    else str(cols)
+                lines.append(
+                    f"| {item.get('requirement', '')} "
+                    f"| {item.get('approach', '')} "
+                    f"| {cols} "
+                    f"| {item.get('open_question', '') or '-'} |")
+        else:
+            lines += [f"{i}. {v}" for i, v in enumerate(val, 1)]
+        lines.append("")
+    notes = plan.get("revision_notes") or []
+    if notes:
+        lines += ["## What changed after EDA, and why", ""]
+        lines += [f"- {n}" for n in notes]
+        lines.append("")
+    return "\n".join(lines)
+
+
+# First line of every plan file the agent writes. Documents in the working
+# directory are loaded as the user's instructions, and a saved plan is the
+# agent's own output: read back as a brief, an old plan (e.g. one that named a
+# wrong target) would override what the user actually asked.
+AGENT_PLAN_MARKER = "<!-- ds-agent generated plan: not user instructions -->"
+# Plans saved before the marker existed start with one of these lines.
+_LEGACY_PLAN_LINES = (
+    "_First pass, written before EDA. The feature and model choices are "
+    "assumptions to be tested._",
+    "_Revised after EDA: the feature and model choices below follow what "
+    "the data showed._",
+)
+
+
+def is_agent_generated_doc(text: str) -> bool:
+    """True when a document is a plan this agent wrote, not user instructions."""
+    head = (text or "")[:600]
+    return AGENT_PLAN_MARKER in head or any(line in head for line in _LEGACY_PLAN_LINES)
+
+
+def _save_plan_file(save_to: str, md: str, *, session, kernel) -> str:
+    """Write the plan through the same approval path as any other file."""
+    md = f"{AGENT_PLAN_MARKER}\n{md}"
+    root = _ws_root(session, kernel)
+    if root is None:
+        return "(Not saved: no working directory set.)"
+    if not save_to.lower().endswith(".md"):
+        save_to += ".md"
+    target = _ws_resolve_within(root, save_to)
+    if target is None:
+        return f"(Not saved: path escapes the working directory: {save_to!r}.)"
+    if not target.parent.is_dir():
+        return f"(Not saved: folder does not exist: {_ws_rel(root, target.parent)}.)"
+    mode = _ws_write_mode(kernel)
+    if mode == "suggest":
+        return f"(Would save the plan to {save_to}; writes are OFF.)"
+    old = target.read_text(errors="replace") if target.is_file() else ""
+    held = _hold_for_approval(
+        kernel, kind="file", rel=save_to, path=target,
+        verb=f"{'update' if old else 'create'} {save_to}",
+        content=md, diff=_unified_diff(old, md, save_to))
+    if held is not None:
+        return (f"(Awaiting your approval to save the plan to {save_to}; "
+                "nothing written.)")
+    try:
+        target.write_text(md)
+    except OSError as exc:
+        return f"(Save failed: {exc}.)"
+    return f"(Saved the plan to {save_to}.)"
+
+
 _ALL_TOOLS: list[BaseTool] = [
+    WorkPlanTool(),
     UnderstandTaskTool(),
     AggregateDataTool(),
     EdaProfileTool(),
@@ -4787,11 +5658,162 @@ _ALL_TOOLS: list[BaseTool] = [
     WriteFileTool(),
     EditFileTool(),
     SqlQueryTool(),
+    WriteSqlTool(),
     DeployModelTool(),
     ScaffoldCICDTool(),
 ]
 
 TOOL_REGISTRY: dict[str, BaseTool] = {t.name: t for t in _ALL_TOOLS}
+
+
+# Tools whose output is evidence about the data, as opposed to evidence about
+# the task or the filesystem. Only these count as "EDA has happened".
+# execute_code is included because the model designs most of its EDA there
+# (group comparisons, ratios, concentration); TOOLS_RUN records successes only.
+_EDA_TOOLS = frozenset({
+    "eda_profile", "deep_eda", "quality_check", "mutual_information",
+    "data_analysis_agent", "execute_code",
+})
+
+
+# ── EDA agenda: the plan's questions, tracked open or answered ──────────────
+#
+# The plan lists the questions EDA must settle. Shown as plain text they were
+# never checked off, so the loop could not tell what was left and wandered into
+# unrelated work. The agenda keeps each question with an id, a status and the
+# finding that settled it; the critic updates it after each step, and a result
+# that raises a new question adds it as a lead.
+
+_AGENDA_MAX = 18
+_LEADS_MAX = 6
+
+
+def _agenda(ns: dict) -> list[dict]:
+    agenda = ns.get("EDA_AGENDA")
+    return agenda if isinstance(agenda, list) else []
+
+
+_STOPWORDS = frozenset(
+    "a across an and any all are as at be between by do does each for from has "
+    "have how in is it of on or per that the there this to what which with "
+    "within".split())
+
+
+def _words(text: str) -> frozenset:
+    """Content words, lightly stemmed so "mapped" matches "mapping". Column
+    names (with underscores) are kept whole: they are what a question is
+    about."""
+    import re as _re
+    out = set()
+    for w in _re.findall(r"[a-z0-9_]+", text.lower()):
+        if w in _STOPWORDS:
+            continue
+        out.add(w if "_" in w or len(w) <= 4 else w[:4])
+    return frozenset(out)
+
+
+def _is_repeat(text: str, agenda: list[dict]) -> bool:
+    """True when a question restates one already on the agenda, judged by the
+    share of the shorter question's content words the two have in common. A
+    revised plan tends to re-add "Is provider_id consistently mapped to
+    provider_name?" for "Is there a consistent mapping between provider_id and
+    provider_name?"."""
+    words = _words(text)
+    cols = {w for w in words if "_" in w}
+    for a in agenda:
+        other = _words(str(a.get("question", "")))
+        other_cols = {w for w in other if "_" in w}
+        if cols and other_cols and cols != other_cols:
+            continue          # about different columns: a different question
+        small = min(len(words), len(other))
+        if small >= 3 and len(words & other) / small >= 0.6:
+            return True
+    return False
+
+
+def sync_agenda(ns: dict, plan: dict) -> list[dict]:
+    """Add the plan's EDA questions to the agenda, keeping what is answered."""
+    agenda = _agenda(ns)
+    for source, key in (("brief", "eda_questions_task"),
+                        ("check", "eda_questions_independent")):
+        for q in plan.get(key) or []:
+            text = str(q).strip() if isinstance(q, str) else ""
+            if not text or len(agenda) >= _AGENDA_MAX or _is_repeat(text, agenda):
+                continue
+            agenda.append({"id": f"Q{len(agenda) + 1}", "question": text[:300],
+                           "source": source, "status": "open", "finding": ""})
+    ns["EDA_AGENDA"] = agenda
+    return agenda
+
+
+def record_findings(ns: dict, ids: list, finding: str) -> list[str]:
+    """Mark agenda items answered with the finding that settled them."""
+    finding = (finding or "").strip()
+    if not finding:
+        return []
+    wanted = {str(i).strip().upper() for i in ids or []}
+    done = []
+    for item in _agenda(ns):
+        if item.get("id", "").upper() in wanted:
+            item["status"] = "answered"
+            item["finding"] = finding[:400]
+            done.append(item["id"])
+    return done
+
+
+def add_lead(ns: dict, question: str) -> str | None:
+    """Add a follow-up question a result raised; bounded so leads cannot crowd
+    out the plan's own questions."""
+    text = (question or "").strip()
+    agenda = _agenda(ns)
+    if (not text or len(agenda) >= _AGENDA_MAX
+            or sum(a.get("source") == "lead" for a in agenda) >= _LEADS_MAX
+            or _is_repeat(text, agenda)):
+        return None
+    item = {"id": f"Q{len(agenda) + 1}", "question": text[:300],
+            "source": "lead", "status": "open", "finding": ""}
+    agenda.append(item)
+    ns["EDA_AGENDA"] = agenda
+    return item["id"]
+
+
+def eda_has_run(kernel) -> bool:
+    """True when an EDA tool has actually produced evidence about the data.
+
+    Deliberately not `EXPLORATION_LOG` truthiness, which is what this used to
+    be. The critic writes that log after ANY tool it judges, and it only skips
+    the retrieval tools, so `understand_task` alone was enough to make a plan
+    look stale: the gate fired before a single row had been profiled, and
+    work_plan(revise=true) then "revised against EDA findings" that contained
+    no EDA. TOOLS_RUN is the critic-independent record, so this also works with
+    DSAGENT_CRITIC=0, where EXPLORATION_LOG is never written at all.
+    """
+    ns = getattr(kernel, "namespace", {}) if kernel is not None else {}
+    if ns.get("DATA_ANALYSIS_REPORT") or ns.get("MI_SCORES"):
+        return True
+    run = ns.get("TOOLS_RUN")
+    if isinstance(run, list) and any(t in _EDA_TOOLS for t in run):
+        return True
+    log = ns.get("EXPLORATION_LOG")
+    if isinstance(log, list):
+        tags = tuple(f"[{t}]" for t in _EDA_TOOLS)
+        return any(isinstance(x, str) and x.startswith(tags) for x in log)
+    return False
+
+
+def work_plan_is_stale(kernel) -> bool:
+    """True when EDA has produced findings the plan has not been revised for.
+
+    A plan written before any data was profiled is a guess about feature
+    engineering and model choice; this is what forces it to be revisited.
+    """
+    ns = getattr(kernel, "namespace", {}) if kernel is not None else {}
+    plan = ns.get("WORK_PLAN")
+    if not isinstance(plan, dict):
+        return False          # no plan at all is a separate problem
+    if not eda_has_run(kernel):
+        return False          # nothing to revise against yet
+    return not plan.get("revised_after_eda", False)
 
 
 def get_tool_schemas() -> list[dict]:

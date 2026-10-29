@@ -1,23 +1,25 @@
 # Single-model configuration:
-#   All tasks use qwen3.8:27b-mlx (Qwen3.5 arch, 27.8B, 262K ctx, tools+vision+thinking)
+#   All tasks use gpt-oss:20b (MoE, ~3.6B active of 21B, 128K ctx, native tools,
+#   no vision). Reasoning model: it writes into a separate thinking channel, so
+#   callers must budget output tokens for the thinking as well as the answer.
 #
 # Override via env vars:
 #   DSAGENT_SCOPE_MODEL=<model>
 #   DSAGENT_CODE_MODEL=<model>
 
-scope_model: "qwen3.8:27b-mlx"
-code_model: "qwen3.8:27b-mlx"
+scope_model: "gpt-oss:20b"
+code_model: "gpt-oss:20b"
 
 task_model_map:
-  understand_task: "qwen3.8:27b-mlx"
-  plan: "qwen3.8:27b-mlx"
-  route: "qwen3.8:27b-mlx"
-  synthesise: "qwen3.8:27b-mlx"
-  qa: "qwen3.8:27b-mlx"
-  code: "qwen3.8:27b-mlx"    # execute_code generation
-  sql: "qwen3.8:27b-mlx"     # SQL generation
-  math: "qwen3.8:27b-mlx"    # numeric/math traces
-  default: "qwen3.8:27b-mlx"
+  understand_task: "gpt-oss:20b"
+  plan: "gpt-oss:20b"
+  route: "gpt-oss:20b"
+  synthesise: "gpt-oss:20b"
+  qa: "gpt-oss:20b"
+  code: "gpt-oss:20b"    # execute_code generation
+  sql: "gpt-oss:20b"     # SQL generation
+  math: "gpt-oss:20b"    # numeric/math traces
+  default: "gpt-oss:20b"
 
 ollama_pull_commands:
-  - "ollama pull qwen3.8:27b-mlx"
+  - "ollama pull gpt-oss:20b"

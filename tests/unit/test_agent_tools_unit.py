@@ -174,7 +174,7 @@ def test_infer_target_data_driven():
     k.namespace["TASK_SPEC"] = {}
     s = _make_session()
     result = InferTargetTool().execute({"hint": "churn"}, session=s, kernel=k,
-                                        llm_client=_make_llm_offline())
+                                        llm_client=_make_llm_online(response='{"target":"churn","reason":"requested label"}'))
     assert result.success is True
     assert s.target == "churn"
 
@@ -198,6 +198,44 @@ def test_infer_target_llm_fallback():
     llm = _make_llm_online(response="target_col")
     result = InferTargetTool().execute({}, session=s, kernel=k, llm_client=llm)
     assert isinstance(result, ToolOutput)
+
+
+def test_infer_target_rejects_date_and_id_as_unlabelled():
+    """All candidates are a date or an identifier → fail loudly, set no target.
+
+    This is the ACC case: service_date must never become the target, and the
+    reply must steer to unsupervised methods rather than invent a label.
+    """
+    k = SessionKernel()
+    df = pd.DataFrame({
+        "claim_id": [f"CLM{i:05d}" for i in range(60)],
+        "service_date": pd.date_range("2023-01-01", periods=60, freq="D").astype(str),
+    })
+    k.namespace["df"] = df
+    k.namespace["TASK_SPEC"] = {"target_column": "service_date"}
+    s = _make_session()
+    result = InferTargetTool().execute({}, session=s, kernel=k,
+                                        llm_client=_make_llm_offline())
+    assert result.success is False
+    assert "unlabelled" in result.text.lower()
+    assert "isolationforest" in result.text.lower() or "anomaly" in result.text.lower()
+    assert not s.target  # never set to a date or an id
+
+
+def test_infer_target_skips_date_spec_picks_valid_column():
+    """A date named in the spec is rejected, and a valid target is used instead."""
+    k = SessionKernel()
+    df = pd.DataFrame({
+        "service_date": pd.date_range("2023-01-01", periods=6, freq="D").astype(str),
+        "fraud": [0, 1, 0, 1, 0, 1],
+    })
+    k.namespace["df"] = df
+    k.namespace["TASK_SPEC"] = {"target_column": "service_date"}
+    s = _make_session()
+    result = InferTargetTool().execute({"hint": "fraud"}, session=s, kernel=k,
+                                        llm_client=_make_llm_online(response='{"target":"fraud","reason":"explicit fraud labels"}'))
+    assert result.success is True
+    assert s.target == "fraud"
 
 
 # ── MutualInfoTool ────────────────────────────────────────────────────────────
@@ -249,7 +287,9 @@ def test_tool_output_with_error():
 from agent.api.agent_tools import ExecuteCodeTool  # noqa: E402
 
 
-def test_execute_code_basic(eda_kernel):
+def test_execute_code_basic(eda_kernel, monkeypatch):
+    from agent.api import sandbox
+    monkeypatch.setattr(sandbox, "execute", lambda *a, **kw: ToolOutput(True, "2"))
     s = _make_session()
     result = ExecuteCodeTool().execute(
         {"code": "result = 1 + 1; print(result)"},
@@ -275,6 +315,38 @@ def test_execute_code_syntax_error(eda_kernel):
         session=s, kernel=eda_kernel, llm_client=_make_llm_offline(),
     )
     assert isinstance(result, ToolOutput)
+
+
+def test_execute_code_refuses_delete(eda_kernel, monkeypatch):
+    monkeypatch.setattr("agent.api.sandbox.shutil.which", lambda name: None)
+    """Generated code cannot delete files: the guard applies on this path too."""
+    s = _make_session()
+    result = ExecuteCodeTool().execute(
+        {"code": "import os; os.remove('something.txt')"},
+        session=s, kernel=eda_kernel, llm_client=_make_llm_offline(),
+    )
+    assert result.success is False
+    assert "No host Python code was executed" in result.error
+
+
+def test_execute_code_confines_relative_write_to_workdir(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.api.sandbox.shutil.which", lambda name: None)
+    """A relative write lands in WORK_DIR, not the process working directory."""
+    import os
+
+    from agent.api.kernel import SessionKernel
+    k = SessionKernel()
+    k.namespace["WORK_DIR"] = tmp_path
+    s = _make_session()
+    before = os.getcwd()
+    result = ExecuteCodeTool().execute(
+        {"code": "open('probe_out.txt', 'w').write('hi')"},
+        session=s, kernel=k, llm_client=_make_llm_offline(),
+    )
+    assert result.success is False
+    assert not (tmp_path / "probe_out.txt").exists()      # written into WORK_DIR
+    assert not (Path(before) / "probe_out.txt").exists()  # not the repo root
+    assert os.getcwd() == before                       # cwd restored
 
 
 # ── UnderstandTaskTool._compute_df_stats ─────────────────────────────────────
@@ -314,6 +386,305 @@ def test_feature_engineering_basic(eda_kernel):
         session=s, kernel=eda_kernel, llm_client=_make_llm_offline(),
     )
     assert isinstance(result, ToolOutput)
+
+
+def test_feature_engineering_acts_on_the_eda_report():
+    """Feature engineering must use what EDA measured, not generic defaults.
+
+    Without the report it label-encodes every categorical, keeps columns EDA
+    flagged as leaking the target, and builds interactions from whichever five
+    numeric columns come first. On the fixture below that selects the leakage
+    column as the single most important feature, which would hand the model the
+    answer and produce a meaningless score.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    n = 400
+    df = pd.DataFrame({
+        "y": rng.integers(0, 2, n),
+        "signal": rng.normal(size=n),
+        "skewed": rng.exponential(5, n),
+        "const": np.ones(n),
+        "idlike": [f"id{i}" for i in range(n)],
+        "noise": rng.normal(size=n),
+    })
+    df["leaky"] = df["y"] * 10.0 + rng.normal(0, 0.01, n)
+    df["signal"] = df["signal"] + df["y"] * 1.5
+
+    def _run(report):
+        k = SessionKernel()
+        k.execute("import pandas as pd")
+        k.namespace["df"] = df.copy()
+        k.namespace["TARGET"] = "y"
+        if report is not None:
+            k.namespace["DATA_ANALYSIS_REPORT"] = report
+        return FeatureEngineeringTool().execute(
+            {"top_k": 8}, session=_make_session(target="y"), kernel=k,
+            llm_client=_make_llm_offline())
+
+    guided = _run({
+        "leakage_suspects": ["leaky"], "near_constant_cols": ["const"],
+        "skewed_cols": {"skewed": 3.2}, "high_cardinality_cols": ["idlike"],
+        "top_mi_features": [("signal", 0.31), ("noise", 0.01)],
+    })
+    assert guided.success
+    assert "inside training folds" in guided.text
+    assert guided.artifacts["preprocessing"] == "fold-local"
+    blind = _run(None)
+    assert blind.success and "no global feature selection" in blind.text
+
+
+def test_plan_json_survives_a_truncated_reply():
+    """A reply cut off by the token budget must not lose the whole plan.
+
+    A local model that runs out mid-list leaves valid JSON and an unterminated
+    tail. The plan costs minutes to produce, so the complete part is kept and
+    the half-written entry dropped.
+    """
+    from agent.api.agent_tools import _extract_json_obj as parse
+
+    assert parse('{"a": 1, "b": ["x","y"]}') == {"a": 1, "b": ["x", "y"]}
+    # Cut mid-list: keep the complete items.
+    assert parse('{"objective":"rank","modelling":["gbm","logistic reg') == {
+        "objective": "rank", "modelling": ["gbm"]}
+    # Cut right after a comma: the dangling comma must go.
+    assert parse('{"a":["one","two"],') == {"a": ["one", "two"]}
+    # Cut inside a nested object: drop the incomplete one, keep the rest.
+    assert parse('{"cov":[{"requirement":"rank","approach":"agg"},'
+                 '{"requirement":"expl') == {
+        "cov": [{"requirement": "rank", "approach": "agg"}]}
+    # Deeply nested.
+    assert parse('{"a":{"b":{"c":["x","y"') == {"a": {"b": {"c": ["x", "y"]}}}
+    # An escaped quote inside a string must not be read as the terminator.
+    assert parse(r'{"a":"he said \"hi\" today","b":["z') == {
+        "a": 'he said "hi" today'}
+    # Prose around the object is fine; nothing usable returns None.
+    assert parse('Here is the plan:\n{"a": 2}\nThanks.') == {"a": 2}
+    assert parse("I could not produce a plan.") is None
+    assert parse("") is None
+
+
+def _plan_llm(scope_json, approach_json):
+    """Stub that answers the two planning stages separately."""
+    def _gen(prompt, **kw):
+        return scope_json if "FIRST half" in prompt else approach_json
+    return SimpleNamespace(_generate=_gen, is_available=lambda: True)
+
+
+_SCOPE = """{
+ "objective": "Rank establishments by injury risk for 2024.",
+ "requirement_coverage": [{"requirement": "Rank businesses",
+   "approach": "aggregate per establishment_id",
+   "columns": ["establishment_id", "incident_outcome"],
+   "open_question": "Is 2024Q1 a holdout?"}],
+ "eda_questions_task": ["What is the positive rate per establishment?"],
+ "eda_questions_independent": ["Are the duplicate rows true repeats?"],
+ "risks": ["date_of_death is 100% null but has values: parsing bug"]}"""
+
+_APPROACH = """{
+ "data_preparation": ["drop incident_year (constant)"],
+ "feature_engineering": ["rate per 200k hours from total_hours_worked"],
+ "modelling": ["gradient boosting: mixed dtypes, 19:1 imbalance"],
+ "evaluation": ["PR AUC, grouped split on establishment_id"],
+ "deliverables": ["ranked csv + notebook"],
+ "revision_notes": []}"""
+
+
+def _plan_kernel():
+    k = SessionKernel()
+    k.execute("import pandas as pd")
+    k.namespace["df"] = pd.DataFrame({"establishment_id": [1, 2, 3],
+                                      "incident_outcome": [1, 2, 1]})
+    k.namespace["TASK_SPEC"] = {
+        "task_type": "binary_classification",
+        "specific_requirements": ["Rank businesses by risk"]}
+    return k
+
+
+def test_read_instructions_resolves_inside_the_working_directory(tmp_path):
+    """A bare filename means "in the working directory", not "next to the server".
+
+    This resolved against the process working directory, so a filename the agent
+    read straight off the workspace map pointed at wherever uvicorn happened to
+    be started from and always failed.
+    """
+    from agent.api.agent_tools import ReadInstructionsTool
+
+    doc = tmp_path / "brief.txt"
+    doc.write_text("Predict which establishments are high risk.")
+    k = SessionKernel()
+    k.namespace["WORK_DIR"] = tmp_path
+
+    def _run(path):
+        return ReadInstructionsTool().execute(
+            {"path": path},
+            session=SimpleNamespace(work_dir=tmp_path, target=None, brief=""),
+            kernel=k, llm_client=None)
+
+    bare = _run("brief.txt")
+    assert bare.success, bare.error
+    assert "brief.txt" in bare.text
+
+    absolute = _run(str(doc))
+    assert absolute.success
+
+    # A miss names what IS there, so the agent can correct itself.
+    missing = _run("nope.pdf")
+    assert missing.success is False
+    assert "nope.pdf" in missing.error and "brief.txt" in missing.error
+
+    assert _run("").success is False
+
+
+def test_work_plan_runs_both_stages_and_stores_the_plan():
+    """Planning is two calls: scope, then approach written against that scope."""
+    from agent.api.agent_tools import WorkPlanTool
+
+    k = _plan_kernel()
+    out = WorkPlanTool().execute(
+        {}, session=_make_session(target=None), kernel=k,
+        llm_client=_plan_llm(_SCOPE, _APPROACH))
+    assert out.success
+    plan = k.namespace["WORK_PLAN"]
+    for section in ("objective", "requirement_coverage", "eda_questions_task",
+                    "eda_questions_independent", "risks", "data_preparation",
+                    "feature_engineering", "modelling", "evaluation",
+                    "deliverables"):
+        assert plan.get(section), f"missing {section}"
+    assert plan["version"] == 1
+    assert plan["revised_after_eda"] is False
+    # Rendered for a human: the coverage mapping becomes a table.
+    assert "| Requirement | Approach | Columns | Open question |" in out.text
+    assert "First pass, written before EDA" in out.text
+
+
+def test_work_plan_keeps_the_scope_when_the_approach_half_fails():
+    """A plan costs minutes; half of one is still worth keeping."""
+    from agent.api.agent_tools import WorkPlanTool
+
+    k = _plan_kernel()
+    out = WorkPlanTool().execute(
+        {}, session=_make_session(target=None), kernel=k,
+        llm_client=_plan_llm(_SCOPE, "not json at all"))
+    assert out.success
+    assert k.namespace["WORK_PLAN"].get("requirement_coverage")
+    assert "did not come back usable" in out.text
+
+
+def test_work_plan_refuses_to_revise_before_any_eda():
+    from agent.api.agent_tools import WorkPlanTool
+
+    k = _plan_kernel()
+    out = WorkPlanTool().execute(
+        {"revise": True}, session=_make_session(target=None), kernel=k,
+        llm_client=_plan_llm(_SCOPE, _APPROACH))
+    assert out.success is False
+    assert "Nothing to revise against yet" in out.error
+
+
+def test_work_plan_revision_is_grounded_in_the_eda_report():
+    """revise=true feeds the measured findings in and marks the plan revised."""
+    from agent.api.agent_tools import WorkPlanTool
+
+    k = _plan_kernel()
+    WorkPlanTool().execute({}, session=_make_session(target=None), kernel=k,
+                           llm_client=_plan_llm(_SCOPE, _APPROACH))
+    k.namespace["DATA_ANALYSIS_REPORT"] = {
+        "n_rows": 14533, "class_imbalance_ratio": 0.05,
+        "leakage_suspects": ["leaky_col"], "skewed_cols": {"dafw": 4.1},
+        "top_mi_features": [("dafw", 0.3)], "null_pcts": {"time_of_incident": 14.0},
+        "near_constant_cols": ["incident_year"], "high_cardinality_cols": ["city"],
+        "outlier_cols": ["total_hours_worked"], "recommended_metric": "pr_auc",
+        "analyst_narrative": "Positives are rare."}
+
+    seen = {}
+
+    def _gen(prompt, **kw):
+        if "FIRST half" in prompt:
+            seen["scope_prompt"] = prompt
+            return _SCOPE
+        return _APPROACH
+
+    out = WorkPlanTool().execute(
+        {"revise": True}, session=_make_session(target=None), kernel=k,
+        llm_client=SimpleNamespace(_generate=_gen, is_available=lambda: True))
+    assert out.success
+    plan = k.namespace["WORK_PLAN"]
+    assert plan["revised_after_eda"] is True
+    assert plan["version"] == 2
+    assert "Revised after EDA" in out.text
+    # The measured facts reached the model, not just the word "revise".
+    p = seen["scope_prompt"]
+    assert "LEAKING columns" in p and "leaky_col" in p
+    assert "incident_year" in p and "class imbalance" in p
+
+
+def test_work_plan_reports_a_model_that_returns_nothing_usable():
+    from agent.api.agent_tools import WorkPlanTool
+
+    out = WorkPlanTool().execute(
+        {}, session=_make_session(target=None), kernel=_plan_kernel(),
+        llm_client=_plan_llm("no json here", "nor here"))
+    assert out.success is False
+    assert "usable scope" in out.error
+
+
+def test_profile_for_planning_gives_real_evidence():
+    """The planner must see dtypes, missingness and cardinality, not a column list.
+
+    A plan written from column names alone can only restate the brief; deciding
+    what to derive or drop needs the numbers.
+    """
+    import numpy as np
+
+    from agent.api.agent_tools import _profile_for_planning
+
+    n = 200
+    df = pd.DataFrame({
+        "est_id": np.arange(n) % 50,
+        "constant_year": [2023] * n,
+        "mostly_null": [None] * (n - 3) + [1.0, 2.0, 3.0],
+        "flag": ["Y", "N"] * (n // 2),
+        "amount": np.linspace(0, 1000, n),
+    })
+    df = pd.concat([df, df.iloc[:5]], ignore_index=True)   # plant duplicates
+    text = _profile_for_planning({"df": df, "df2": df[["est_id", "flag"]]})
+
+    assert "duplicate rows: 5" in text
+    assert "constant_year" in text and "1 distinct" in text
+    assert "nulls 98%" in text or "nulls 99%" in text      # mostly_null
+    assert "values Y, N" in text or "values N, Y" in text  # small-cardinality
+    assert "range 0..1000" in text                          # numeric range
+    # Shared columns are candidate join keys and must be called out.
+    assert "possible join keys" in text
+    assert "est_id" in text.split("possible join keys")[1]
+
+
+def test_profile_for_planning_survives_no_data():
+    from agent.api.agent_tools import _profile_for_planning
+    assert _profile_for_planning({}) == "(no data loaded)"
+
+
+def test_plan_markdown_renders_requirement_coverage_table():
+    """requirement_coverage is a mapping, so it renders as a table."""
+    from agent.api.agent_tools import _plan_to_markdown
+    md = _plan_to_markdown({
+        "objective": "Rank businesses by risk.",
+        "requirement_coverage": [
+            {"requirement": "Rank 1000 businesses",
+             "approach": "Aggregate incidents per establishment_id",
+             "columns": ["establishment_id", "incident_outcome"],
+             "open_question": "Is 2024Q1 a holdout or extra training data?"}],
+        "eda_questions_task": ["What is the positive rate?"],
+        "eda_questions_independent": ["Are the 151 duplicate rows real repeats?"],
+        "revised_after_eda": False,
+    }, {"target_column": "risk"})
+    assert "| Requirement | Approach | Columns | Open question |" in md
+    assert "`establishment_id`" in md
+    assert "Is 2024Q1 a holdout" in md
+    assert "EDA: questions the brief requires answering" in md
+    assert "EDA: independent checks on the data" in md
 
 
 def test_feature_engineering_no_target(eda_kernel):
